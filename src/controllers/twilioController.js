@@ -4,6 +4,8 @@
  */
 
 const twilio = require("twilio");
+const { ConnectorClient } = require("livekit-server-sdk");
+const { ConnectTwilioCallRequest_TwilioCallDirection } = require("@livekit/protocol");
 const openAIRealtimeService = require("../services/openAIRealtimeService");
 const elevenLabsService = require("../services/elevenLabsService");
 const configurationService = require("../services/configurationService");
@@ -11,6 +13,14 @@ const configurationService = require("../services/configurationService");
 const client = twilio(
   process.env.TWILIO_ACCOUNT_SID,
   process.env.TWILIO_AUTH_TOKEN
+);
+
+// LiveKit Connector client — bridges Twilio Media Streams into a LiveKit room.
+// Reads its endpoint/credentials from LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET.
+const connectorClient = new ConnectorClient(
+  process.env.LIVEKIT_URL,
+  process.env.LIVEKIT_API_KEY,
+  process.env.LIVEKIT_API_SECRET
 );
 
 /**
@@ -55,6 +65,55 @@ const handleIncomingCall = async (req, res) => {
       return res.send(twiml);
     } catch (error) {
       console.error("ElevenLabs registerCall failed:", error.message);
+      // Fallback: play an error message and hang up
+      const errorTwiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we are unable to connect your call right now. Please try again later.</Say></Response>`;
+      res.type("text/xml");
+      return res.send(errorTwiml);
+    }
+  }
+
+  // LiveKit path
+  // Bridge the inbound call into a LiveKit room via the Twilio Connector.
+  // connectTwilioCall provisions the room, dispatches our named agent
+  // ("serveai-poc"), and returns a WebSocket URL that Twilio streams audio to.
+  // ServeAI is out of the audio path from here — LiveKit owns the conversation.
+  if (config.provider === "livekit") {
+    try {
+      const { connectUrl } = await connectorClient.connectTwilioCall({
+        twilioCallDirection:
+          ConnectTwilioCallRequest_TwilioCallDirection.TWILIO_CALL_DIRECTION_INBOUND,
+        roomName: `call-${callSid}`,
+        participantIdentity: callerNumber,
+        participantName: callerNumber,
+        // Explicit dispatch — agentName must match the worker's WorkerOptions.agentName.
+        // metadata carries this call's prompt + greeting (from ServeAI config) to the
+        // worker, which reads it as ctx.job.metadata. RoomAgentDispatch.metadata is a string.
+        // chatflowId/callSid/callerNumber are added so the worker can persist the
+        // conversation to ServeAI chat history (Step 3a); chatflowId may be undefined,
+        // in which case the worker logs only and skips persistence.
+        agents: [
+          {
+            agentName: "serveai-poc",
+            metadata: JSON.stringify({
+              prompt: config.prompt,
+              greeting: config.greeting,
+              chatflowId: config.chatflowId,
+              callSid,
+              callerNumber,
+            }),
+          },
+        ],
+      });
+
+      // Stream the call's audio to LiveKit over the returned WebSocket URL.
+      const twiml =
+        `<?xml version="1.0" encoding="UTF-8"?>` +
+        `<Response><Connect><Stream url="${connectUrl}" /></Connect></Response>`;
+
+      res.type("text/xml");
+      return res.send(twiml);
+    } catch (error) {
+      console.error("LiveKit connectTwilioCall failed:", error.message);
       // Fallback: play an error message and hang up
       const errorTwiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we are unable to connect your call right now. Please try again later.</Say></Response>`;
       res.type("text/xml");

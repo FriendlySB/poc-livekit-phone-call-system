@@ -1,0 +1,33 @@
+{
+  "name": "phone-call-poc",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "alawmulaw": "^6.0.0",
+    "audio-buffer-utils": "^5.1.2",
+    "audiobuffer-to-wav": "^1.0.0",
+    "axios": "^1.6.0",
+    "dotenv": "^16.3.1",
+    "eventsource": "^4.0.0",
+    "express": "^4.18.2",
+    "fastify": "^5.6.2",
+    "openai": "^6.9.1",
+    "pcm-convert": "^1.6.5",
+    "twilio": "^5.10.6",
+    "web-audio-resampler": "^1.0.4",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  }
+}

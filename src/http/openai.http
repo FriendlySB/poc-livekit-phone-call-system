@@ -1,0 +1,48 @@
+### Create a Test OpenAI Session
+POST http://localhost:6000/api/test/create-session
+Content-Type: application/json
+
+###
+
+### Test TTS (Text-to-Speech) - Use CallSid from create-session response
+# Replace TEST_1234567890 with actual test CallSid
+POST http://localhost:6000/api/openai/speak/TEST_1731331200000
+Content-Type: application/json
+
+{
+  "text": "Hello! This is a test of the OpenAI text to speech system. How does it sound?"
+}
+
+###
+
+### Get Transcripts for Test Session
+# Replace TEST_1234567890 with actual test CallSid
+GET http://localhost:6000/api/openai/transcripts/TEST_1731331200000
+
+###
+
+### Close Test Session
+# Replace TEST_1234567890 with actual test CallSid
+DELETE http://localhost:6000/api/test/close-session/TEST_1731331200000
+
+###
+
+### Get All Active Sessions (including test sessions)
+GET http://localhost:6000/api/openai/sessions
+
+###
+
+### Complete Test Flow Example
+# 1. Create session
+POST http://localhost:6000/api/test/create-session
+
+# 2. Copy the callSid from response, then test TTS
+# POST http://localhost:6000/api/openai/speak/{callSid}
+
+# 3. Check transcripts (will show TTS requests)
+# GET http://localhost:6000/api/openai/transcripts/{callSid}
+
+# 4. Close session when done
+# DELETE http://localhost:6000/api/test/close-session/{callSid}
+
+###

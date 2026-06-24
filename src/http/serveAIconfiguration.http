@@ -1,0 +1,8 @@
+@base_url = {{$dotenv SERVE_AI_API_ENDPOINT}}/configurations
+@clientId = {{$dotenv SERVE_AI_CLIENT_ID}}
+@clientSecret = {{$dotenv SERVE_AI_CLIENT_SECRET}}
+@basic = Basic {{clientId}}:{{clientSecret}}
+
+### Get configuration for phone call POC
+GET {{base_url}}/phoneCallPOCSettings
+Authorization: {{basic}}

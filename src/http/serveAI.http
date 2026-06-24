@@ -1,0 +1,28 @@
+@base_url = {{$dotenv SERVE_AI_API_ENDPOINT}}/chatbot
+@clientId = {{$dotenv SERVE_AI_CLIENT_ID}}
+@clientSecret = {{$dotenv SERVE_AI_CLIENT_SECRET}}
+@basic = Basic {{clientId}}:{{clientSecret}}
+
+### POST prompt chatbot non streaming
+POST {{base_url}}/prompt/non-streaming
+Authorization: {{basic}}
+Content-Type: application/json
+
+{
+  "message": "Hello there! Can you introduce yourself?",
+  "chatId":"d327411f-7285-4e57-be2a-e4335f85d376-68b4f97cb310501ad75f5a55-aiAssistant-v11",
+  "chatflowId":"d327411f-7285-4e57-be2a-e4335f85d376",
+  "restrictHTML":true
+}
+
+### POST prompt chatbot streaming
+POST {{base_url}}/prompt
+Authorization: {{basic}}
+Content-Type: application/json
+
+{
+  "message": "Hello there! Can you introduce yourself?",
+  "chatId":"fdc34dfc-8361-4b3c-9314-710449d520d8-68b4f97cb310501ad75f5a55-aiAssistant-v38",
+  "chatflowId":"fdc34dfc-8361-4b3c-9314-710449d520d8",
+  "restrictHTML":true
+}

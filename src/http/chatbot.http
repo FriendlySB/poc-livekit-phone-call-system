@@ -1,0 +1,30 @@
+### Test Chatbot Integration
+POST http://localhost:6000/api/chatbot/test
+Content-Type: application/json
+
+{
+  "message": "Hello! Can you introduce yourself?"
+}
+
+###
+
+### Test with specific call ID
+POST http://localhost:6000/api/chatbot/test
+Content-Type: application/json
+
+{
+  "message": "What data do you have access to?",
+  "callSid": "TEST_CHAT_001"
+}
+
+###
+
+### Get Active Chat Sessions
+GET http://localhost:6000/api/chatbot/sessions
+
+###
+
+### Clear Chat Session
+DELETE http://localhost:6000/api/chatbot/sessions/TEST_CHAT_001
+
+###

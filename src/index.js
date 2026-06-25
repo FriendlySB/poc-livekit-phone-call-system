@@ -10,17 +10,33 @@ const elevenLabsRoutes = require("./routes/elevenLabsRoutes");
 const openAIRealtimeService = require("./services/openAIRealtimeService");
 const elevenLabsService = require("./services/elevenLabsService");
 const twilioStreamService = require("./services/twilioStreamService");
+const livekitBridgeService = require("./services/livekitBridgeService");
 
 
 const app = express();
 const port = process.env.PORT || 5000;
 const server = http.createServer(app);
 
-// Create WebSocket server for human agent streams
-const wss = new WebSocket.Server({ server, path: '/api/twilio/media-stream' });
+// Two Twilio Media Streams WebSocket endpoints share one HTTP server, so we use the
+// `noServer` pattern and route the upgrade by path (stacking two { server, path }
+// servers does not work reliably):
+//   /api/twilio/media-stream   -> human-agent / transcription streams (existing)
+//   /api/twilio/livekit-bridge -> self-hosted Twilio<->LiveKit audio bridge
+const mediaStreamWss = new WebSocket.Server({ noServer: true });
+const bridgeWss = new WebSocket.Server({ noServer: true });
 
-wss.on('connection', (ws, req) => {
-  twilioStreamService.handleConnection(ws, req);
+mediaStreamWss.on('connection', (ws, req) => twilioStreamService.handleConnection(ws, req));
+bridgeWss.on('connection', (ws) => livekitBridgeService.handleConnection(ws));
+
+server.on('upgrade', (req, socket, head) => {
+  const { pathname } = new URL(req.url, `http://${req.headers.host}`);
+  if (pathname === '/api/twilio/media-stream') {
+    mediaStreamWss.handleUpgrade(req, socket, head, (ws) => mediaStreamWss.emit('connection', ws, req));
+  } else if (pathname === '/api/twilio/livekit-bridge') {
+    bridgeWss.handleUpgrade(req, socket, head, (ws) => bridgeWss.emit('connection', ws, req));
+  } else {
+    socket.destroy();
+  }
 });
 
 // Middleware — these routes need the raw body (must be registered before express.json())

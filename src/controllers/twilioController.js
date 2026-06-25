@@ -74,12 +74,39 @@ const handleIncomingCall = async (req, res) => {
 
   // LiveKit path
   // Bridge the inbound call into a LiveKit room via the Twilio Connector.
-  // connectTwilioCall provisions the room, dispatches our named agent
-  // ("serveai-poc"), and returns a WebSocket URL that Twilio streams audio to.
-  // ServeAI is out of the audio path from here — LiveKit owns the conversation.
   if (config.provider === "livekit") {
+    // Self-hosted mode: the OSS livekit-server has no Twilio Connector, so route the
+    // call to our own Twilio<->LiveKit bridge (src/services/livekitBridgeService.js)
+    // with a <Connect><Stream>. This call's ServeAI config rides along as <Parameter>s,
+    // which the bridge reads from the Media Streams `start` event and forwards to the
+    // agent as dispatch metadata (same shape the Cloud path uses).
+    if (process.env.LIVEKIT_MODE === "selfhost") {
+      const bridgeUrl = `wss://${process.env.HOST}/api/twilio/livekit-bridge`;
+      const esc = (v) =>
+        String(v ?? "")
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;");
+      const params = [
+        ["prompt", config.prompt],
+        ["greeting", config.greeting],
+        ["chatflowId", config.chatflowId],
+        ["callSid", callSid],
+        ["callerNumber", callerNumber],
+      ]
+        .map(([name, value]) => `<Parameter name="${name}" value="${esc(value)}" />`)
+        .join("");
+      const twiml =
+        `<?xml version="1.0" encoding="UTF-8"?>` +
+        `<Response><Connect><Stream url="${bridgeUrl}">${params}</Stream></Connect></Response>`;
+      res.type("text/xml");
+      return res.send(twiml);
+    }
+
+    // Cloud mode: managed Twilio Connector (connectTwilioCall).
     try {
-      const { connectUrl } = await connectorClient.connectTwilioCall({
+      const res = await connectorClient.connectTwilioCall({
         twilioCallDirection:
           ConnectTwilioCallRequest_TwilioCallDirection.TWILIO_CALL_DIRECTION_INBOUND,
         roomName: `call-${callSid}`,
@@ -104,6 +131,9 @@ const handleIncomingCall = async (req, res) => {
           },
         ],
       });
+      console.log(JSON.stringify(res, null, 2));
+      const connectUrl = res.connectUrl;
+      console.log("LiveKit connectTwilioCall succeeded, connectUrl:", connectUrl);
 
       // Stream the call's audio to LiveKit over the returned WebSocket URL.
       const twiml =
@@ -113,6 +143,7 @@ const handleIncomingCall = async (req, res) => {
       res.type("text/xml");
       return res.send(twiml);
     } catch (error) {
+      console.log("Error connecting Twilio call to LiveKit:", error);
       console.error("LiveKit connectTwilioCall failed:", error.message);
       // Fallback: play an error message and hang up
       const errorTwiml = `<?xml version="1.0" encoding="UTF-8"?><Response><Say>Sorry, we are unable to connect your call right now. Please try again later.</Say></Response>`;

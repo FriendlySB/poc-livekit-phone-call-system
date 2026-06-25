@@ -104,8 +104,15 @@ export default defineAgent({
       // Turn-taking: decide when the caller has finished so we don't reply mid-sentence.
       turnHandling: {
         // Lower the end-of-turn confidence threshold (default ~0.56).
-        turnDetection: new inference.TurnDetector({ unlikelyThreshold: 0.2 }),
-        // Endpointing waits, in ms, since the last detected speech. 
+        turnDetection: new inference.TurnDetector({
+          unlikelyThreshold: 0.2,
+          // On a self-hosted server there's no LiveKit Cloud inference gateway, so
+          // the default cloud model ("v1") can't connect — it burns ~4-6s retrying
+          // on every call before falling back. Use the local in-process "v1-mini"
+          // model directly. Cloud mode keeps the better cloud model via auto-select.
+          ...(process.env.LIVEKIT_MODE === "selfhost" ? { version: "v1-mini" } : {}),
+        }),
+        // Endpointing waits, in ms, since the last detected speech.
         endpointing: { minDelay: 300, maxDelay: 1200 },
       },
     });

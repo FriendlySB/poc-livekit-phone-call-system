@@ -8,20 +8,25 @@
  * assigns the job here; the worker joins the room and runs a full cascaded
  * STT -> LLM -> TTS voice pipeline so the caller can converse freely.
  *
- *   STT: ElevenLabs scribe_v2_realtime (multilingual auto-detect) — our own key
+ *   STT: ElevenLabs scribe_v2_realtime | self-hosted Speaches whisper (STT_PROVIDER)
  *   LLM: OpenAI gpt-4.1 via the Responses API                — our own key
- *   TTS: ElevenLabs eleven_flash_v2_5                            — our own key
- *   VAD: bundled Silero, auto-provisioned by AgentSession        — nothing to add
+ *   TTS: ElevenLabs multilingual | self-hosted Speaches Kokoro (TTS_PROVIDER)
+ *   VAD: bundled local Silero (inference.VAD), shared by the session + STT adapter
+ *
+ * STT/TTS provider selection lives in agentProviders.mjs; both default to ElevenLabs.
  *
  * The system prompt and the spoken greeting come from ServeAI config, passed
  * per-call as dispatch metadata (ctx.job.metadata), along with chatflowId,
  * callSid and callerNumber for chat-history persistence.
  *
- * Scope: conversation + transcription persistence (Step 3a). Every finalized
- * caller turn and agent reply is written to ServeAI chat history via a sequential
- * queue (ordered, one insert at a time) and flushed on shutdown. Persistence is
- * gated on chatflowId — if it's absent the worker logs only, exactly like Step 2.
- * No tool calls yet.
+ * Scope: conversation + transcription persistence (Step 3a) + ServeAI tool calling
+ * (Step 3b). Every finalized caller turn and agent reply is written to ServeAI chat
+ * history via a sequential queue (ordered, one insert at a time) and flushed on
+ * shutdown. The LLM is also given 6 granular ServeAI tools (knowledge + appointment
+ * actions, see agentTools.mjs) so it can act on the call, matching the ElevenLabs
+ * agent. Both persistence and tools are gated on chatflowId — if it's absent the
+ * worker logs only and exposes no tools, exactly like Step 2. (addHumanAgent transfer
+ * is deferred to a later phase.)
  * Run:   `npm run agent`  (runs `node src/agent.mjs dev`)
  *
  * ESM (.mjs): @livekit/agents is ESM-only, so this worker is a standalone ESM
@@ -30,12 +35,15 @@
  */
 
 import { defineAgent, voice, cli, WorkerOptions, inference } from "@livekit/agents";
-import * as elevenlabs from "@livekit/agents-plugin-elevenlabs";
 import * as openai from "@livekit/agents-plugin-openai";
 import { fileURLToPath } from "node:url";
 import "dotenv/config";
 import chatbotService from "./services/chatbotService.js";
 import { createPersistQueue } from "./persistQueue.mjs";
+// STT/TTS are chosen per-env (ElevenLabs default | self-hosted Speaches) — see agentProviders.mjs.
+import { createStt, createTts, warmSpeachesTts } from "./agentProviders.mjs";
+// ServeAI knowledge/appointment tools exposed to the LLM — see agentTools.mjs.
+import { createServeAiTools } from "./agentTools.mjs";
 
 export default defineAgent({
   // prewarm runs in the (optionally pre-forked) job process BEFORE entry, so the
@@ -45,7 +53,11 @@ export default defineAgent({
   prewarm: (proc) => {
     const llm = new openai.responses.LLM({
       apiKey: process.env.OPENAI_API_KEY,
-      model: "gpt-4.1",
+      // gpt-4.1-mini: lower time-to-first-token than gpt-4.1 — the single biggest
+      // chunk of response latency on this stack (~0.95s -> ~0.4-0.5s). This agent is
+      // conversation-only (no tools), so mini's quality is more than sufficient.
+      // Revert to "gpt-4.1" if reply quality regresses.
+      model: process.env.AGENT_LLM_MODEL || "gpt-4.1-mini",
     });
     llm.prewarm();
     proc.userData.llm = llm;
@@ -67,6 +79,13 @@ export default defineAgent({
     const queue = chatflowId
       ? createPersistQueue(chatbotService, { chatflowId, callSid, callerNumber })
       : null;
+
+    // ServeAI tools for the LLM (knowledge + appointment actions). Gated on chatflowId
+    // for the same reason as the queue: without it there's no ServeAI session to query.
+    // undefined -> the Agent below gets no tools, so it's conversation-only like Step 2.
+    const tools = chatflowId
+      ? createServeAiTools(chatbotService, { chatflowId, callSid, callerNumber })
+      : undefined;
     // Drain the queue before the per-job process exits (caller hung up), so the
     // last enqueued/in-flight turns reach ServeAI instead of being lost. Registered
     // now (before session.start) so a flush still happens if startup later fails.
@@ -77,43 +96,56 @@ export default defineAgent({
       });
     }
 
+    // STT (Speaches batch whisper) commits no interim transcripts, so the semantic
+    // end-of-utterance model has nothing incremental to score. In that mode we fall
+    // back to pure VAD turn detection; the ElevenLabs streaming path keeps the better
+    // EOU detector. This flag also widens the turn-grouping timings below.
+    const useSpeachesStt = process.env.STT_PROVIDER === "speaches";
+
+    // Bundled, local Silero VAD (no cloud). Shared by the AgentSession (turn-taking
+    // / interruption) and, when STT_PROVIDER=speaches, by the STT StreamAdapter that
+    // endpoints batch whisper. AgentSession would auto-provision an identical one if
+    // omitted; we create it explicitly so the same instance backs both consumers.
+    // For batch STT, widen minSilenceDuration above the 250ms default so a brief
+    // mid-thought pause is less likely to end the turn and fragment multi-part speech
+    // ("...that's it." pause "Thank you.") into two turns. This is a compromise: 700ms
+    // grouped multi-part speech well but added ~0.45s of felt turn-end delay; 450ms
+    // trades a little grouping for snappier replies — the VAD window is the most-felt
+    // turn-end latency we control (STT/LLM cost the rest). It's the only turn-grouping
+    // knob here, since batch STT yields no interim transcripts for a semantic detector.
+    const sttVad = new inference.VAD({
+      model: "silero",
+      ...(useSpeachesStt ? { minSilenceDuration: 450 } : {}),
+    });
+
     const session = new voice.AgentSession({
-      // STT — ElevenLabs Scribe v2 realtime, our own key (reuses ELEVENLABS_API_KEY,
-      // same account as the TTS). scribe_v2_realtime is the streaming model and
-      // transcribes noticeably better than gpt-4o-transcribe. languageCode is
-      // omitted so it auto-detects per utterance (multilingual). Note: keyterm
-      // biasing is NOT supported on the realtime model, only on batch Scribe.
-      stt: new elevenlabs.STT({
-        apiKey: process.env.ELEVENLABS_API_KEY,
-        modelId: "scribe_v2_realtime",
-        // The realtime model commits a final transcript only after its server-side
-        // VAD sees a silence gap — default 1.5s, which was the bulk of the response
-        // lag. Shorten it to 0.6s (range 0.3–3s) so the final lands ~0.9s sooner.
-        // The local turn detector above still decides if the turn is truly over, so
-        // an early commit on a mid-sentence pause just gets re-evaluated, not acted on.
-        serverVad: { vadSilenceThresholdSecs: 0.6 },
-      }),
+      // STT/TTS are selected per-env (ElevenLabs default | self-hosted Speaches).
+      stt: createStt(process.env, sttVad),
       // LLM orchestrator — reuse the connection prewarmed above
       llm: ctx.proc.userData.llm,
-      // TTS — connect directly to ElevenLabs with our own key.
-      tts: new elevenlabs.TTS({
-        apiKey: process.env.ELEVENLABS_API_KEY,
-        voiceId: process.env.ELEVENLABS_VOICE_ID,
-        model: "eleven_multilingual_v2",
-      }),
+      tts: createTts(process.env),
+      // Explicit VAD shared with the STT adapter (see above).
+      vad: sttVad,
       // Turn-taking: decide when the caller has finished so we don't reply mid-sentence.
       turnHandling: {
-        // Lower the end-of-turn confidence threshold (default ~0.56).
-        turnDetection: new inference.TurnDetector({
-          unlikelyThreshold: 0.2,
-          // On a self-hosted server there's no LiveKit Cloud inference gateway, so
-          // the default cloud model ("v1") can't connect — it burns ~4-6s retrying
-          // on every call before falling back. Use the local in-process "v1-mini"
-          // model directly. Cloud mode keeps the better cloud model via auto-select.
-          ...(process.env.LIVEKIT_MODE === "selfhost" ? { version: "v1-mini" } : {}),
-        }),
-        // Endpointing waits, in ms, since the last detected speech.
-        endpointing: { minDelay: 300, maxDelay: 1200 },
+        turnDetection: useSpeachesStt
+          ? // Batch STT -> rely on VAD silence to end the turn.
+            "vad"
+          : // Lower the end-of-turn confidence threshold (default ~0.56).
+            new inference.TurnDetector({
+              unlikelyThreshold: 0.2,
+              // On a self-hosted server there's no LiveKit Cloud inference gateway, so
+              // the default cloud model ("v1") can't connect — it burns ~4-6s retrying
+              // on every call before falling back. Use the local in-process "v1-mini"
+              // model directly. Cloud mode keeps the better cloud model via auto-select.
+              ...(process.env.LIVEKIT_MODE === "selfhost" ? { version: "v1-mini" } : {}),
+            }),
+        // Endpointing waits, in ms, since the last detected speech. For batch STT,
+        // keep minDelay aligned with the VAD window (above) so the turn doesn't commit
+        // before the grouping pause elapses; ElevenLabs streaming STT stays snappy.
+        endpointing: useSpeachesStt
+          ? { minDelay: 450, maxDelay: 2000 }
+          : { minDelay: 300, maxDelay: 1200 },
       },
     });
 
@@ -147,6 +179,9 @@ export default defineAgent({
       agent: new voice.Agent({
         instructions:
           prompt || "You are a friendly phone assistant. Keep replies short and natural.",
+        // ServeAI knowledge/appointment tools (undefined when no chatflowId -> no tools).
+        // The framework runs the tool-call loop automatically when the LLM invokes one.
+        tools,
         // Use the LLM's own text as the transcript, NOT ElevenLabs' TTS alignment.
         // With this on (the default), the session replaces the transcript with the
         // TTS's normalizedAlignment chars, which ElevenLabs romanizes for non-Latin
@@ -157,6 +192,11 @@ export default defineAgent({
       }),
       room: ctx.room,
     });
+    // Speaches/Kokoro cold-loads in ~6s; warm it now so the greeting below doesn't
+    // get cut off by the pipeline's first-frame timeout. No-op for ElevenLabs.
+    if (process.env.TTS_PROVIDER === "speaches") {
+      await warmSpeachesTts(process.env);
+    }
     await session.say(greeting || "Hello, how can I help you?", {
       allowInterruptions: false,
     });

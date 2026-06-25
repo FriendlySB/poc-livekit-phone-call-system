@@ -70,6 +70,115 @@ All call behaviour is driven by configuration fetched from ServeAI at the start 
 
 Today's date and time (Malaysia Time, UTC+8) is automatically injected into the prompt before every call.
 
+## Self-Hosted STT/TTS (Speaches)
+
+The LiveKit agent worker (`src/agent.mjs`) runs a cascaded **STT → LLM → TTS** pipeline. Its STT and
+TTS legs can each be switched, independently, between **ElevenLabs** (cloud, the default) and a
+**self-hosted [Speaches](https://speaches.ai) box** via the `STT_PROVIDER` / `TTS_PROVIDER` env vars.
+Speaches is a single OpenAI-compatible Docker container that serves **both** whisper STT
+(`/v1/audio/transcriptions`) and Kokoro TTS (`/v1/audio/speech`), so one container covers both legs.
+
+Provider selection lives in `src/agentProviders.mjs`. Leaving the switches unset keeps the original
+ElevenLabs behaviour, so you can A/B each leg on a real call.
+
+### Prerequisites
+
+- **Docker Desktop** with the WSL2 backend.
+- An **NVIDIA GPU** + recent driver for the `:latest-cuda` image. CPU-only works with the plain
+  `:latest` image (drop `--gpus all`) but is much slower.
+
+### 1. Start the container
+
+```bash
+docker run --rm -d --gpus all -p 8000:8000 --name speaches \
+  -e WHISPER__INFERENCE_DEVICE=cuda -e WHISPER__COMPUTE_TYPE=float16 \
+  -e WHISPER__TTL=-1 \
+  -v hf-hub-cache:/home/ubuntu/.cache/huggingface/hub \
+  ghcr.io/speaches-ai/speaches:latest-cuda
+```
+
+- The API listens on **container port 8000** (mapped to host 8000). The Gradio **Playground UI** is at
+  <http://localhost:8000>.
+- `-v hf-hub-cache:...` persists downloaded models across restarts (a named Docker volume).
+- `WHISPER__TTL=-1` stops the STT model from offloading. **TTL field names vary by image** — check the
+  config dump that `docker logs speaches` prints at startup; the `:latest-cuda` build reads
+  `WHISPER__TTL`, not `STT_MODEL_TTL`. Models still **cold-load on first use** (Kokoro ~6s; whisper's
+  first CUDA inference compiles kernels, 10-30s), so warm them once before calling — see step 3.
+- `WHISPER__COMPUTE_TYPE=float16` is important on **RTX 50-series (Blackwell)**: `int8` compute crashes
+  cuBLAS there; `float16`/`bfloat16` work.
+- `-d` runs detached and prints the container ID. Watch it with `docker logs -f speaches`; stop it with
+  `docker stop speaches`.
+
+### 2. Download the models
+
+Models are pulled **server-side** into the cache volume. Either use the Playground UI (Models tab at
+<http://localhost:8000>), or the Speaches CLI via `uvx` (runs the CLI without installing it — get `uv`
+from <https://astral.sh/uv> if you don't have it):
+
+```bash
+# Tell the CLI where the server is — note: the server ROOT, no /v1 suffix
+export SPEACHES_BASE_URL=http://localhost:8000
+
+uvx speaches-cli model download Systran/faster-whisper-base          # STT (whisper)
+uvx speaches-cli model download speaches-ai/Kokoro-82M-v1.0-ONNX      # TTS (Kokoro)
+```
+
+> The CLI's `SPEACHES_BASE_URL` is the server root (`http://localhost:8000`). The **app's**
+> `SPEACHES_BASE_URL` in `.env` is the OpenAI API base and **must end in `/v1`** — they are not the same value.
+
+### 3. Warm up & verify
+
+Cold loads are slow, and the agent cuts off a turn if the first TTS frame doesn't arrive within ~10s —
+so a cold model makes the **greeting silent and the first transcript fail**. Hit both endpoints once
+before any real call to load + warm them (run the STT one **twice** — the second should be sub-second):
+
+```bash
+# TTS — Kokoro; also save a wav to feed the STT warmup
+curl http://localhost:8000/v1/audio/speech \
+  -H "Content-Type: application/json" \
+  -d '{"input":"warm up","model":"speaches-ai/Kokoro-82M-v1.0-ONNX","voice":"af_heart","response_format":"wav"}' \
+  --output warm.wav
+
+# STT — whisper (first run may take 10-30s: kernel compile; run again to confirm it's now fast)
+curl -X POST http://localhost:8000/v1/audio/transcriptions \
+  -F "file=@warm.wav" -F "model=Systran/faster-whisper-base"
+```
+
+Or use the Playground UI at <http://localhost:8000> (STT/TTS tabs).
+
+### 4. Point the agent at Speaches
+
+Set the switches and Speaches config in `.env` (see the env reference below), then run the LiveKit
+agent worker:
+
+```bash
+npm run agent
+```
+
+Each leg is independent — e.g. `TTS_PROVIDER=speaches` with `STT_PROVIDER=elevenlabs` to get the cost
+win on TTS while keeping ElevenLabs transcription quality.
+
+### Notes & caveats
+
+- **Batch STT.** The OpenAI-compatible whisper endpoint is non-streaming, so the agent runs it in batch
+  mode wrapped in a local **Silero VAD** (bundled in `@livekit/agents`, no cloud). Because batch STT
+  emits no interim transcripts, turn-taking automatically falls back to VAD endpointing when
+  `STT_PROVIDER=speaches`.
+- **STT model.** `faster-whisper-base` is fast but too inaccurate on 8 kHz phone audio — use
+  `deepdml/faster-whisper-large-v3-turbo-ct2` (≈large-v3 accuracy, ~0.7 s on the GPU). Kokoro/TTS has
+  **no Malay** and weak Mandarin — use a different TTS for SEA languages.
+- **Latency.** A laptop self-host won't beat ElevenLabs' cloud. Measure on a **real streamed call**, not
+  the Playground (which does batch round-trips and isn't representative).
+- **Cold start.** The first call after startup (or after a model offloads) pays the load time and can
+  arrive too late for the agent's first-frame timeout — silent greeting / aborted first transcript. Keep
+  models warm (`WHISPER__TTL=-1` + the warm-up in step 3) and don't let the box sit idle before a demo.
+- **Large models on Blackwell (RTX 50-series).** `large-v3-turbo` runs fine on the GPU at `float16`
+  (verified on an RTX 5060, ~0.7 s/utterance) — Blackwell is **not** the blocker. If a transcription
+  hangs/never returns, the real causes are: (1) a **truncated download** — verify the model dir is
+  ~1.6 GB with **no `*.incomplete`** files (a partial `model.bin` segfaults CTranslate2 and restarts the
+  container), and (2) a **slow first inference** right after a fresh pull. If a *complete* model still
+  misbehaves, last-resort fallback is CPU (`-e WHISPER__INFERENCE_DEVICE=cpu`), slower but reliable.
+
 ## API Endpoints
 
 ### Twilio Webhooks (`/api/phone-call/twilio`)
@@ -190,3 +299,11 @@ The ElevenLabs post-call webhook delivers the full AI agent transcript (Phase 1)
 | `SERVE_AI_API_ENDPOINT` | Yes | Base URL of the ServeAI API |
 | `SERVE_AI_CLIENT_ID` | Yes | ServeAI Basic Auth client ID |
 | `SERVE_AI_CLIENT_SECRET` | Yes | ServeAI Basic Auth client secret |
+| `STT_PROVIDER` | No | LiveKit agent STT leg: `elevenlabs` (default) or `speaches` |
+| `TTS_PROVIDER` | No | LiveKit agent TTS leg: `elevenlabs` (default) or `speaches` |
+| `SPEACHES_BASE_URL` | If `speaches` | Speaches OpenAI API base — **must end in `/v1`** (e.g. `http://localhost:8000/v1`) |
+| `SPEACHES_API_KEY` | No | Speaches auth token; any non-empty string (e.g. `speaches`) unless auth is enabled |
+| `SPEACHES_STT_MODEL` | If STT `speaches` | Whisper model ID (e.g. `Systran/faster-whisper-base`) |
+| `SPEACHES_STT_LANGUAGE` | No | ISO language code for STT (defaults to `en` if unset) |
+| `SPEACHES_TTS_MODEL` | If TTS `speaches` | TTS model ID (e.g. `speaches-ai/Kokoro-82M-v1.0-ONNX`) |
+| `SPEACHES_TTS_VOICE` | If TTS `speaches` | TTS voice (e.g. `af_heart`) |

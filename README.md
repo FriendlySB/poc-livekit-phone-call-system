@@ -179,6 +179,147 @@ win on TTS while keeping ElevenLabs transcription quality.
   container), and (2) a **slow first inference** right after a fresh pull. If a *complete* model still
   misbehaves, last-resort fallback is CPU (`-e WHISPER__INFERENCE_DEVICE=cpu`), slower but reliable.
 
+## Self-Hosted STREAMING STT (sherpa-onnx)
+
+`STT_PROVIDER=sherpa` runs a **self-hosted, in-process streaming** speech-to-text via
+[sherpa-onnx](https://github.com/k2-fsa/sherpa-onnx) (k2-fsa). Unlike Speaches/Whisper (batch — buffer
+the whole utterance, then transcribe, no interim results), sherpa transcribes **as the caller speaks**
+and emits interim transcripts — removing the post-speech batch wait and re-enabling the semantic turn
+detector. It needs **no server, no Docker, no GPU**: it runs inside the agent worker through the
+`sherpa-onnx-node` native addon and is real-time on CPU (RTF ~0.06, ~16× real-time). **STT only** — the
+TTS leg is unaffected (`TTS_PROVIDER` still picks ElevenLabs or Speaches Kokoro).
+
+### 1. Install the addon
+Already in `package.json` (`npm install` pulls it, with a prebuilt Windows binary — no compilation).
+
+### 2. Download a streaming English model
+Stored under `models/` (gitignored). `tar` ships with Windows 10/11:
+```bash
+mkdir models && cd models
+curl -L -O https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-21.tar.bz2
+tar -xjf sherpa-onnx-streaming-zipformer-en-2023-06-21.tar.bz2
+```
+This yields `models/sherpa-onnx-streaming-zipformer-en-2023-06-21/` with `encoder/decoder/joiner*.onnx`
++ `tokens.txt` (the filenames the `SHERPA_STT_*` env defaults expect). The `2023-06-21` model is trained
+on LibriSpeech + **GigaSpeech** (robust to varied/phone audio); the int8 files are the smaller/faster default.
+
+#### Alternative: streaming paraformer (`SHERPA_STT_MODEL_TYPE=paraformer`)
+A second model family is supported — the FunASR streaming **paraformer** (encoder + decoder, **no
+joiner**, so the recognizer config key differs; the module handles it). The available streaming
+paraformer is **bilingual zh-en**, i.e. Chinese-first with English as a *minority* of the training
+data — so for English phone audio it may be **worse** than the English-specialised zipformer. A/B it
+before trusting it. Download:
+```bash
+cd models
+curl -L -O https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-paraformer-bilingual-zh-en.tar.bz2
+tar -xjf sherpa-onnx-streaming-paraformer-bilingual-zh-en.tar.bz2
+```
+Then set `SHERPA_STT_MODEL_TYPE=paraformer`, `SHERPA_STT_MODEL_DIR=./models/sherpa-onnx-streaming-paraformer-bilingual-zh-en`,
+`SHERPA_STT_ENCODER=encoder.int8.onnx`, `SHERPA_STT_DECODER=decoder.int8.onnx` (the `.env` ships these
+ready to uncomment). Note the int8 encoder is ~158 MB (vs the zipformer's tens of MB), so prewarm/RAM
+are heavier.
+
+### 3. Validate before going live (smoke test)
+```bash
+node scripts/sherpaSmokeTest.mjs                                  # bundled 16 kHz English sample
+node scripts/sherpaSmokeTest.mjs models/.../test_wavs/8k.wav      # 8 kHz phone-rate sample
+```
+It prints partial transcripts, the final, and the RTF. Confirm English accuracy + RTF < 1 before wiring
+it into a call.
+
+### 4. Point the agent at sherpa
+Set `STT_PROVIDER=sherpa` and the `SHERPA_STT_*` paths in `.env` (see the env reference), then
+`npm run agent`. The ~190 MB model loads once in the worker's **prewarm** (not per call), so the first
+caller turn isn't cold.
+
+### Notes & caveats
+
+- **Streaming vs batch.** Because sherpa emits interim transcripts, turn-taking uses the semantic
+  `TurnDetector` (like ElevenLabs), **not** the VAD-only path Speaches falls back to. sherpa does its own
+  endpoint detection (`rule1/2/3MinTrailingSilence`) to segment utterances.
+- **Resampling.** Telephony is 8 kHz; the model wants 16 kHz. The `@livekit/agents` `SpeechStream` base
+  auto-resamples (we pass `sampleRate:16000`), so no extra dependency — the module just converts
+  Int16→Float32 for `acceptWaveform`.
+- **English-first.** This model is English (LibriSpeech/GigaSpeech). For other languages swap in a
+  different sherpa streaming model and update the `SHERPA_STT_*` paths.
+- **No GPU needed.** CPU is real-time; this sidesteps the Whisper/Blackwell GPU saga entirely.
+
+## Self-Hosted OFFLINE STT (sherpa-onnx SenseVoice)
+
+`STT_PROVIDER=sensevoice` runs a **self-hosted, in-process OFFLINE (batch)** STT via sherpa-onnx
+**SenseVoice**. Unlike the streaming sherpa path, this is a *non-streaming* recognizer — the in-process
+counterpart to Speaches/Whisper, meant as a **faster A/B target vs Whisper while keeping accuracy**.
+SenseVoice does a single **non-autoregressive** forward pass per utterance (no token-by-token LLM
+decoding), so it's fast on CPU. It needs **no server, no Docker, no GPU**. **STT only** — TTS is unaffected.
+
+Because it's batch (no interim transcripts), it plugs in like Speaches: wrapped in `stt.StreamAdapter` +
+the shared VAD, so turn-taking uses the VAD path (**no semantic turn detector, no PREFLIGHT** — those are
+the streaming providers).
+
+### 1. Download the model
+Stored under `models/` (gitignored). HuggingFace serves files individually (no tarball):
+```bash
+mkdir -p models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2025-09-09
+cd models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2025-09-09
+curl.exe -L -O https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2025-09-09/resolve/main/model.onnx
+curl.exe -L -O https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2025-09-09/resolve/main/tokens.txt
+```
+This repo ships **fp32 `model.onnx` (~930 MB) only** (no int8). It's the canonical 5-language SenseVoice-Small
+(zh/en/ja/ko/yue); we pin `SENSEVOICE_LANGUAGE=en`.
+
+### 2. Validate before going live (smoke test)
+```bash
+node scripts/senseVoiceSmokeTest.mjs models/sherpa-onnx-streaming-zipformer-en-2023-06-21/test_wavs/8k.wav
+```
+It prints the transcript + RTF. Confirm clean English (no Chinese chars) and RTF well under the Whisper
+~0.7 s budget before wiring it into a call.
+
+### 3. Point the agent at SenseVoice
+Set `STT_PROVIDER=sensevoice` and the `SENSEVOICE_*` paths in `.env`, then `npm run agent`. The ~930 MB
+model loads once in the worker's **prewarm** (not per call), so the first caller turn isn't cold.
+
+### Notes & caveats
+- **Batch, not streaming.** No PREFLIGHT / no semantic turn detection on this path — the win vs Whisper is
+  the fast in-process single-pass decode (no Docker round-trip, no autoregression), not turn-taking.
+- **fp32 weight.** ~930 MB load/RAM (the worker logs a ~2.6 GB advisory). If memory is tight, the int8
+  `sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17-int8` tarball is a drop-in (repoint the dir/file).
+- **Language pin.** `SENSEVOICE_LANGUAGE=en` keeps it on English so it won't drift to Chinese like the
+  paraformer did. Codes: `auto|zh|en|ja|ko|yue`.
+
+## Self-Hosted TTS (Chatterbox)
+
+`TTS_PROVIDER=chatterbox` drives a **self-hosted [Chatterbox](https://github.com/devnen/Chatterbox-TTS-Server)**
+(Resemble AI, MIT) TTS server — chosen as a **higher-quality A/B target vs Speaches/Kokoro**. It runs on the
+**GPU** as a separate process (not in-process, not the Speaches container). **TTS only** — STT is unaffected.
+
+Chatterbox exposes an OpenAI-compatible `POST /v1/audio/speech`, but **only supports `wav`/`opus`/`mp3` — no
+`pcm`**, while LiveKit's stock `openai.TTS` plugin hardcodes `response_format: "pcm"`. So this leg uses a small
+**custom client** ([src/chatterboxTts.mjs](src/chatterboxTts.mjs)) that requests `wav` (24 kHz mono pcm_16),
+strips the RIFF header, and streams the PCM. It's a batch TTS auto-wrapped for per-sentence synthesis, like Kokoro.
+
+### 1. Run the Chatterbox server
+The server lives **outside this repo** (sibling clone). Start it manually before placing a call:
+```powershell
+cd ../Chatterbox-TTS-Server
+.\venv\Scripts\python.exe server.py     # or: .\start.bat  — Web UI at http://localhost:8004/
+```
+It loads the model at boot (`chatterbox-turbo`). Stop with `Ctrl+C`.
+
+### 2. Point the agent at Chatterbox
+Set `TTS_PROVIDER=chatterbox` and the `CHATTERBOX_*` vars in `.env` (see the env reference), then `npm run agent`.
+The voice is a predefined-voice **filename** (e.g. `Emily.wav` — must include `.wav`). The worker fires a
+**warm-up** synthesis before the greeting (the first synth pays a ~8.6 s CUDA-kernel warmup that would otherwise
+trip the pipeline's first-frame timeout).
+
+### Notes & caveats
+- **wav-only, custom client.** Unlike Kokoro (stock `openai.TTS`), Chatterbox needs the custom adapter because
+  the plugin won't parse a WAV container — see the module header for the full why.
+- **Latency.** Higher quality than Kokoro but slower per-synth (warm RTF ≈ 0.7). Per-sentence streaming + the
+  pre-greeting warm-up hide most of it; if it's still too slow on calls, the lever is the server's streaming
+  `/tts` endpoint (out of scope here).
+- **Separate lifecycle.** The server is a process you start/stop yourself; if it's down, the first turn errors
+  (same failure mode as Speaches being down). `CHATTERBOX_BASE_URL` must end in `/v1`.
+
 ## API Endpoints
 
 ### Twilio Webhooks (`/api/phone-call/twilio`)
@@ -299,11 +440,25 @@ The ElevenLabs post-call webhook delivers the full AI agent transcript (Phase 1)
 | `SERVE_AI_API_ENDPOINT` | Yes | Base URL of the ServeAI API |
 | `SERVE_AI_CLIENT_ID` | Yes | ServeAI Basic Auth client ID |
 | `SERVE_AI_CLIENT_SECRET` | Yes | ServeAI Basic Auth client secret |
-| `STT_PROVIDER` | No | LiveKit agent STT leg: `elevenlabs` (default) or `speaches` |
-| `TTS_PROVIDER` | No | LiveKit agent TTS leg: `elevenlabs` (default) or `speaches` |
+| `STT_PROVIDER` | No | **Optional local override** for the STT leg (`elevenlabs`/`speaches`/`sherpa`/`sensevoice`). Selection is normally per-call via ServeAI `phoneCallConfig.liveKitSTT`; this only applies when the config omits it. Also warm-preloads sherpa/SenseVoice in prewarm when set. |
+| `TTS_PROVIDER` | No | **Optional local override** for the TTS leg (`elevenlabs`/`speaches`/`chatterbox`). Selection is normally per-call via ServeAI `phoneCallConfig.liveKitTTS`; this only applies when the config omits it. |
 | `SPEACHES_BASE_URL` | If `speaches` | Speaches OpenAI API base — **must end in `/v1`** (e.g. `http://localhost:8000/v1`) |
 | `SPEACHES_API_KEY` | No | Speaches auth token; any non-empty string (e.g. `speaches`) unless auth is enabled |
 | `SPEACHES_STT_MODEL` | If STT `speaches` | Whisper model ID (e.g. `Systran/faster-whisper-base`) |
 | `SPEACHES_STT_LANGUAGE` | No | ISO language code for STT (defaults to `en` if unset) |
 | `SPEACHES_TTS_MODEL` | If TTS `speaches` | TTS model ID (e.g. `speaches-ai/Kokoro-82M-v1.0-ONNX`) |
 | `SPEACHES_TTS_VOICE` | If TTS `speaches` | TTS voice (e.g. `af_heart`) |
+| `CHATTERBOX_BASE_URL` | If TTS `chatterbox` | Chatterbox OpenAI API base — **must end in `/v1`** (e.g. `http://localhost:8004/v1`) |
+| `CHATTERBOX_API_KEY` | No | Dummy token; Chatterbox has no auth (any string, e.g. `chatterbox`) |
+| `CHATTERBOX_TTS_MODEL` | If TTS `chatterbox` | Model name in the request (e.g. `chatterbox-turbo`); the loaded model is fixed server-side |
+| `CHATTERBOX_TTS_VOICE` | If TTS `chatterbox` | Predefined-voice **filename**, must include `.wav` (e.g. `Emily.wav`) |
+| `SHERPA_STT_MODEL_TYPE` | No | `transducer` (zipformer, default) or `paraformer` (FunASR zh-en; encoder+decoder, no joiner) |
+| `SHERPA_STT_MODEL_DIR` | If STT `sherpa` | Folder holding the extracted streaming model (path from project root) |
+| `SHERPA_STT_ENCODER` / `_DECODER` / `_JOINER` / `_TOKENS` | No | Model filenames within the dir (defaults are type-aware; paraformer ignores `_JOINER`) |
+| `SHERPA_STT_NUM_THREADS` | No | Decode threads (default `2`) |
+| `SHERPA_STT_LANGUAGE` | No | Language tag attached to transcripts (default `en`) |
+| `SENSEVOICE_MODEL_DIR` | If STT `sensevoice` | Folder holding the SenseVoice model (path from project root) |
+| `SENSEVOICE_MODEL` / `_TOKENS` | No | Model filenames within the dir (default `model.onnx` / `tokens.txt`) |
+| `SENSEVOICE_LANGUAGE` | No | Forced language `auto\|zh\|en\|ja\|ko\|yue` (default `en`) |
+| `SENSEVOICE_NUM_THREADS` | No | Decode threads (default `2`) |
+| `SENSEVOICE_USE_ITN` | No | Inverse text normalization, `1`/`0` (default `1`) |

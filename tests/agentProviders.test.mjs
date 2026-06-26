@@ -15,6 +15,9 @@ import { stt, inference, initializeLogger } from "@livekit/agents";
 import * as elevenlabs from "@livekit/agents-plugin-elevenlabs";
 import * as openai from "@livekit/agents-plugin-openai";
 import { createStt, createTts } from "../src/agentProviders.mjs";
+import { SherpaSTT } from "../src/sherpaStt.mjs";
+import { SenseVoiceSTT } from "../src/senseVoiceStt.mjs";
+import { ChatterboxTTS } from "../src/chatterboxTts.mjs";
 
 // The ElevenLabs plugin grabs a logger at construction; the worker normally calls
 // this during startup, so initialize it once before any provider is built.
@@ -29,6 +32,10 @@ const baseEnv = {
   SPEACHES_STT_MODEL: "Systran/faster-whisper-base",
   SPEACHES_TTS_MODEL: "speaches-ai/Kokoro-82M-v1.0-ONNX",
   SPEACHES_TTS_VOICE: "af_heart",
+  CHATTERBOX_BASE_URL: "http://localhost:8004/v1",
+  CHATTERBOX_API_KEY: "chatterbox",
+  CHATTERBOX_TTS_MODEL: "chatterbox-turbo",
+  CHATTERBOX_TTS_VOICE: "Emily.wav",
 };
 
 // A real (but un-started) local VAD for the STT adapter; native model loads lazily
@@ -45,9 +52,28 @@ test("STT_PROVIDER=speaches -> batch STT wrapped in a StreamAdapter", () => {
   assert.ok(s instanceof stt.StreamAdapter);
 });
 
+test("STT_PROVIDER=sherpa -> in-process streaming SherpaSTT (no model load)", () => {
+  const s = createStt({ ...baseEnv, STT_PROVIDER: "sherpa" }, vad());
+  assert.ok(s instanceof SherpaSTT);
+  assert.equal(s.capabilities.streaming, true);
+});
+
+test("STT_PROVIDER=sensevoice -> offline SenseVoiceSTT wrapped in a StreamAdapter (no model load)", () => {
+  const s = createStt({ ...baseEnv, STT_PROVIDER: "sensevoice" }, vad());
+  assert.ok(s instanceof stt.StreamAdapter);
+});
+
 test("TTS_PROVIDER=speaches -> non-streaming OpenAI TTS (no StreamAdapter)", () => {
   const t = createTts({ ...baseEnv, TTS_PROVIDER: "speaches" });
   assert.ok(t instanceof openai.TTS);
+});
+
+test("TTS_PROVIDER=chatterbox -> custom ChatterboxTTS (not the openai plugin)", () => {
+  const t = createTts({ ...baseEnv, TTS_PROVIDER: "chatterbox" });
+  assert.ok(t instanceof ChatterboxTTS);
+  assert.equal(t.capabilities.streaming, false);
+  assert.equal(t.sampleRate, 24000);
+  assert.equal(t.numChannels, 1);
 });
 
 test("legs are independent: Speaches TTS keeps ElevenLabs STT", () => {

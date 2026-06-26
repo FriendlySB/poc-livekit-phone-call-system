@@ -26,6 +26,9 @@ Thumbs.db
 # Coverage reports
 coverage/
 
+# Local STT/TTS model files (large binaries — downloaded per the README, never committed)
+models/
+
 # Misc
 *.tgz
 docs/

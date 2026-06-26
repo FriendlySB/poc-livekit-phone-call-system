@@ -108,6 +108,9 @@ class LiveKitBridgeService {
       const greeting = get("greeting");
       const chatflowId = get("chatflowId");
       const callerNumber = get("callerNumber");
+      // Per-call STT/TTS leg selection from ServeAI config — forwarded to the agent.
+      const liveKitSTT = get("liveKitSTT");
+      const liveKitTTS = get("liveKitTTS");
       const roomName = `call-${callSid}`;
 
       console.log(`LiveKit bridge: start call ${callSid} -> room ${roomName}`);
@@ -148,7 +151,15 @@ class LiveKitBridgeService {
         process.env.LIVEKIT_API_SECRET
       );
       await dispatch.createDispatch(roomName, AGENT_NAME, {
-        metadata: JSON.stringify({ prompt, greeting, chatflowId, callSid, callerNumber }),
+        metadata: JSON.stringify({
+          prompt,
+          greeting,
+          chatflowId,
+          callSid,
+          callerNumber,
+          liveKitSTT,
+          liveKitTTS,
+        }),
       });
 
       this.activeBridges.set(callSid, { room, ws });

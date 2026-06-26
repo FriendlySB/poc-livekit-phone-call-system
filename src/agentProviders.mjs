@@ -2,17 +2,25 @@
  * Voice-pipeline provider factories for the LiveKit agent worker.
  *
  * Selects the STT and TTS implementations from environment variables so each leg
- * can be swapped between ElevenLabs (cloud, default) and a self-hosted Speaches
- * box (OpenAI-compatible) independently, for A/B-ing latency/quality/cost:
+ * can be swapped independently, for A/B-ing latency/quality/cost:
  *
- *   STT_PROVIDER = elevenlabs | speaches   (default elevenlabs)
- *   TTS_PROVIDER = elevenlabs | speaches   (default elevenlabs)
+ *   STT_PROVIDER = elevenlabs | speaches | sherpa | sensevoice   (default elevenlabs)
+ *   TTS_PROVIDER = elevenlabs | speaches | chatterbox            (default elevenlabs)
  *
+ * STT options: ElevenLabs (cloud streaming), Speaches (self-hosted Whisper, BATCH via
+ * StreamAdapter), sherpa-onnx (self-hosted STREAMING, in-process — see sherpaStt.mjs), or
+ * SenseVoice (self-hosted OFFLINE/batch, in-process — see senseVoiceStt.mjs). There is no
+ * sherpa/sensevoice TTS; both are STT-only and the TTS leg is unaffected by them.
+ * TTS options: ElevenLabs (cloud), Speaches/Kokoro (self-hosted, OpenAI-compatible), or
+ * Chatterbox (self-hosted, wav-only OpenAI endpoint — custom client, see chatterboxTts.mjs).
  */
 
 import { stt } from "@livekit/agents";
 import * as elevenlabs from "@livekit/agents-plugin-elevenlabs";
 import * as openai from "@livekit/agents-plugin-openai";
+import { SherpaSTT } from "./sherpaStt.mjs";
+import { SenseVoiceSTT } from "./senseVoiceStt.mjs";
+import { ChatterboxTTS, warmChatterboxTts } from "./chatterboxTts.mjs";
 
 /**
  * Build the STT for this session.
@@ -21,6 +29,18 @@ import * as openai from "@livekit/agents-plugin-openai";
  *        StreamAdapter to endpoint batch transcription (ignored for ElevenLabs).
  */
 export function createStt(env, vad) {
+  if (env.STT_PROVIDER === "sherpa") {
+    // Self-hosted STREAMING STT (in-process sherpa-onnx). It self-endpoints and emits
+    // interim transcripts, so the `vad` arg is unused here. See sherpaStt.mjs.
+    return new SherpaSTT(env);
+  }
+
+  if (env.STT_PROVIDER === "sensevoice") {
+    // Self-hosted OFFLINE SenseVoice (in-process sherpa-onnx). Batch like Speaches: wrap in
+    // a StreamAdapter so the shared VAD segments utterances and feeds them to _recognize.
+    return new stt.StreamAdapter(new SenseVoiceSTT(env), vad);
+  }
+
   if (env.STT_PROVIDER === "speaches") {
     // Batch whisper via Speaches' OpenAI-compatible /v1/audio/transcriptions,
     // wrapped so AgentSession can consume it as a streaming STT.
@@ -48,6 +68,12 @@ export function createStt(env, vad) {
  * @param {NodeJS.ProcessEnv} env - provider switch + Speaches config source.
  */
 export function createTts(env) {
+  if (env.TTS_PROVIDER === "chatterbox") {
+    // Self-hosted Chatterbox via its OpenAI-compatible /v1/audio/speech. The stock openai.TTS
+    // can't be used (it forces response_format:"pcm"; Chatterbox is wav-only) — see chatterboxTts.mjs.
+    return new ChatterboxTTS(env);
+  }
+
   if (env.TTS_PROVIDER === "speaches") {
     // Non-streaming Kokoro via Speaches' /v1/audio/speech (24 kHz mono PCM).
     // Passed as-is; the framework auto-wraps it for per-sentence streaming. See the
@@ -67,6 +93,10 @@ export function createTts(env) {
     model: "eleven_multilingual_v2",
   });
 }
+
+// Chatterbox's pre-greeting warm-up lives in chatterboxTts.mjs; re-export it here so
+// agent.mjs imports both warm-up helpers from this one provider module.
+export { warmChatterboxTts };
 
 /**
  * Pre-load the Speaches TTS model before the agent speaks its greeting.

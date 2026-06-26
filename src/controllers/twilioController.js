@@ -94,6 +94,10 @@ const handleIncomingCall = async (req, res) => {
         ["chatflowId", config.chatflowId],
         ["callSid", callSid],
         ["callerNumber", callerNumber],
+        // Per-call STT/TTS leg selection from ServeAI config (agent reads these as the
+        // provider keys; absent -> agent falls back to its env defaults).
+        ["liveKitSTT", config.liveKitSTT],
+        ["liveKitTTS", config.liveKitTTS],
       ]
         .map(([name, value]) => `<Parameter name="${name}" value="${esc(value)}" />`)
         .join("");
@@ -127,6 +131,9 @@ const handleIncomingCall = async (req, res) => {
               chatflowId: config.chatflowId,
               callSid,
               callerNumber,
+              // Per-call STT/TTS leg selection from ServeAI config (see agent.mjs).
+              liveKitSTT: config.liveKitSTT,
+              liveKitTTS: config.liveKitTTS,
             }),
           },
         ],

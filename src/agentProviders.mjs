@@ -5,14 +5,15 @@
  * can be swapped independently, for A/B-ing latency/quality/cost:
  *
  *   STT_PROVIDER = elevenlabs | speaches | sherpa | sensevoice   (default elevenlabs)
- *   TTS_PROVIDER = elevenlabs | speaches | chatterbox            (default elevenlabs)
+ *   TTS_PROVIDER = elevenlabs | speaches | chatterbox | voxcpm   (default elevenlabs)
  *
  * STT options: ElevenLabs (cloud streaming), Speaches (self-hosted Whisper, BATCH via
  * StreamAdapter), sherpa-onnx (self-hosted STREAMING, in-process — see sherpaStt.mjs), or
  * SenseVoice (self-hosted OFFLINE/batch, in-process — see senseVoiceStt.mjs). There is no
  * sherpa/sensevoice TTS; both are STT-only and the TTS leg is unaffected by them.
- * TTS options: ElevenLabs (cloud), Speaches/Kokoro (self-hosted, OpenAI-compatible), or
- * Chatterbox (self-hosted, wav-only OpenAI endpoint — custom client, see chatterboxTts.mjs).
+ * TTS options: ElevenLabs (cloud), Speaches/Kokoro (self-hosted, OpenAI-compatible),
+ * Chatterbox (self-hosted, wav-only OpenAI endpoint — custom client, see chatterboxTts.mjs),
+ * or VoxCPM 1.5 (self-hosted nano-vLLM-VoxCPM, raw-PCM /generate — custom client, see voxcpmTts.mjs).
  */
 
 import { stt } from "@livekit/agents";
@@ -21,6 +22,7 @@ import * as openai from "@livekit/agents-plugin-openai";
 import { SherpaSTT } from "./sherpaStt.mjs";
 import { SenseVoiceSTT } from "./senseVoiceStt.mjs";
 import { ChatterboxTTS, warmChatterboxTts } from "./chatterboxTts.mjs";
+import { VoxcpmTTS, warmVoxcpmTts } from "./voxcpmTts.mjs";
 
 /**
  * Build the STT for this session.
@@ -74,6 +76,12 @@ export function createTts(env) {
     return new ChatterboxTTS(env);
   }
 
+  if (env.TTS_PROVIDER === "voxcpm") {
+    // Self-hosted VoxCPM 1.5 via nano-vLLM-VoxCPM's /generate (non-OpenAI; we use our raw-PCM
+    // fork mode and a fixed reference-clone voice) — custom client, see voxcpmTts.mjs.
+    return new VoxcpmTTS(env);
+  }
+
   if (env.TTS_PROVIDER === "speaches") {
     // Non-streaming Kokoro via Speaches' /v1/audio/speech (24 kHz mono PCM).
     // Passed as-is; the framework auto-wraps it for per-sentence streaming. See the
@@ -94,9 +102,10 @@ export function createTts(env) {
   });
 }
 
-// Chatterbox's pre-greeting warm-up lives in chatterboxTts.mjs; re-export it here so
-// agent.mjs imports both warm-up helpers from this one provider module.
+// Chatterbox's and VoxCPM's pre-greeting warm-ups live in their own client modules;
+// re-export them here so agent.mjs imports every warm-up helper from this one module.
 export { warmChatterboxTts };
+export { warmVoxcpmTts };
 
 /**
  * Pre-load the Speaches TTS model before the agent speaks its greeting.

@@ -11,7 +11,7 @@
  *   STT: ElevenLabs scribe_v2_realtime | Speaches whisper (batch) | sherpa-onnx
  *        (self-hosted streaming) | SenseVoice (self-hosted offline batch)
  *   LLM: OpenAI gpt-4.1 via the Responses API                — our own key
- *   TTS: ElevenLabs multilingual | self-hosted Speaches Kokoro | self-hosted Chatterbox
+ *   TTS: ElevenLabs multilingual | self-hosted Speaches Kokoro | self-hosted Chatterbox | self-hosted VoxCPM 1.5
  *   VAD: bundled local Silero (inference.VAD), shared by the session + STT adapter
  *
  * Provider selection is PER CALL: ServeAI's phoneCallConfig.liveKitSTT/liveKitTTS arrive in the
@@ -45,7 +45,7 @@ import "dotenv/config";
 import chatbotService from "./services/chatbotService.js";
 import { createPersistQueue } from "./persistQueue.mjs";
 // STT/TTS are chosen per-env (ElevenLabs default | self-hosted Speaches) — see agentProviders.mjs.
-import { createStt, createTts, warmSpeachesTts, warmChatterboxTts } from "./agentProviders.mjs";
+import { createStt, createTts, warmSpeachesTts, warmChatterboxTts, warmVoxcpmTts } from "./agentProviders.mjs";
 // ServeAI knowledge/appointment tools exposed to the LLM — see agentTools.mjs.
 import { createServeAiTools } from "./agentTools.mjs";
 // Offline SenseVoice model preloader (in-process; loaded in prewarm) — see senseVoiceStt.mjs.
@@ -231,12 +231,14 @@ export default defineAgent({
       room: ctx.room,
     });
     // Self-hosted TTS pays a cold-start on its first synthesis (Kokoro ~6s model load;
-    // Chatterbox ~8.6s CUDA-kernel warmup). Warm it now so the greeting below isn't cut
+    // Chatterbox/VoxCPM CUDA-kernel warmup). Warm it now so the greeting below isn't cut
     // off by the pipeline's first-frame timeout. No-op for ElevenLabs.
     if (ttsEnv.TTS_PROVIDER === "speaches") {
       await warmSpeachesTts(ttsEnv);
     } else if (ttsEnv.TTS_PROVIDER === "chatterbox") {
       await warmChatterboxTts(ttsEnv);
+    } else if (ttsEnv.TTS_PROVIDER === "voxcpm") {
+      await warmVoxcpmTts(ttsEnv);
     }
     await session.say(greeting || "Hello, how can I help you?", {
       allowInterruptions: false,

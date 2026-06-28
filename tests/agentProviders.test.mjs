@@ -18,6 +18,7 @@ import { createStt, createTts } from "../src/agentProviders.mjs";
 import { SherpaSTT } from "../src/sherpaStt.mjs";
 import { SenseVoiceSTT } from "../src/senseVoiceStt.mjs";
 import { ChatterboxTTS } from "../src/chatterboxTts.mjs";
+import { VoxcpmTTS } from "../src/voxcpmTts.mjs";
 
 // The ElevenLabs plugin grabs a logger at construction; the worker normally calls
 // this during startup, so initialize it once before any provider is built.
@@ -36,6 +37,8 @@ const baseEnv = {
   CHATTERBOX_API_KEY: "chatterbox",
   CHATTERBOX_TTS_MODEL: "chatterbox-turbo",
   CHATTERBOX_TTS_VOICE: "Emily.wav",
+  // No VOXCPM_VOICE_FILE here -> VoxcpmTTS falls back to zero-shot silently (no file read).
+  VOXCPM_BASE_URL: "http://localhost:8001",
 };
 
 // A real (but un-started) local VAD for the STT adapter; native model loads lazily
@@ -73,6 +76,14 @@ test("TTS_PROVIDER=chatterbox -> custom ChatterboxTTS (not the openai plugin)", 
   assert.ok(t instanceof ChatterboxTTS);
   assert.equal(t.capabilities.streaming, false);
   assert.equal(t.sampleRate, 24000);
+  assert.equal(t.numChannels, 1);
+});
+
+test("TTS_PROVIDER=voxcpm -> custom VoxcpmTTS (not the openai plugin), 44.1kHz mono", () => {
+  const t = createTts({ ...baseEnv, TTS_PROVIDER: "voxcpm" });
+  assert.ok(t instanceof VoxcpmTTS);
+  assert.equal(t.capabilities.streaming, false);
+  assert.equal(t.sampleRate, 44100);
   assert.equal(t.numChannels, 1);
 });
 

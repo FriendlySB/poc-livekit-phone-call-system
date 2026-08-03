@@ -320,6 +320,42 @@ trip the pipeline's first-frame timeout).
 - **Separate lifecycle.** The server is a process you start/stop yourself; if it's down, the first turn errors
   (same failure mode as Speaches being down). `CHATTERBOX_BASE_URL` must end in `/v1`.
 
+## Self-Hosted TTS (Pocket)
+
+`TTS_PROVIDER=pocket` drives **self-hosted [Kyutai Pocket TTS](https://github.com/kyutai-labs/pocket-tts)**
+(100M params, MIT) — a **CPU-only** TTS with voice cloning. Its draw here is that it runs entirely on the
+**CPU**, freeing the GPU for STT and sidestepping the 8 GB VRAM contention the GPU TTS options
+(Chatterbox/VoxCPM) hit. **TTS only** — STT is unaffected.
+
+Unlike Chatterbox/VoxCPM, Pocket needs **no custom client**: it's served behind a community
+**OpenAI-compatible server** ([teddybear082/pocket-tts-openai_streaming_server](https://github.com/teddybear082/pocket-tts-openai_streaming_server))
+whose `POST /v1/audio/speech` emits **24 kHz mono PCM** — exactly what LiveKit's stock `openai.TTS` plugin
+expects — so this leg reuses the same `openai.TTS` path as Speaches/Kokoro.
+
+### 1. Run the Pocket server
+The server lives **outside this repo** (sibling clone). One-time setup + start:
+```powershell
+git clone https://github.com/teddybear082/pocket-tts-openai_streaming_server ../pocket-tts-server
+cd ../pocket-tts-server
+python -m venv venv; .\venv\Scripts\pip install -r requirements.txt   # CPU PyTorch is enough
+.\venv\Scripts\python.exe server.py                                    # listens on :49112
+```
+First run downloads the ~100M model. Stop with `Ctrl+C`.
+
+### 2. Point the agent at Pocket
+Set `TTS_PROVIDER=pocket` and the `POCKET_*` vars in `.env` (see the env reference), then `npm run agent`.
+`POCKET_TTS_VOICE` is either a **built-in voice name** (`alba`, `giovanni`, `lola`, …) or a **cloned-voice
+filename** — to clone, drop a clean 5–20 s `.wav` in the server's voices dir and name it here. The worker
+fires a **warm-up** synthesis before the greeting so the CPU model load doesn't trip the first-frame timeout.
+
+### Notes & caveats
+- **CPU-only, no VRAM.** The whole point: pair it with GPU whisper STT and the card is used by STT alone.
+  Avoid pairing with a CPU STT (sherpa/SenseVoice) under load — they'd contend for cores.
+- **~real-time on this CPU.** Faster than real-time on an M4, ~real-time on an Intel Core Ultra 7; per-sentence
+  streaming + the warm-up keep it under LiveKit's ~10 s stall watchdog, but watch felt latency.
+- **English-only** at present. **Third-party server** (community repo, MIT) — runs local-only. `POCKET_BASE_URL`
+  must end in `/v1`.
+
 ## API Endpoints
 
 ### Twilio Webhooks (`/api/phone-call/twilio`)
@@ -441,7 +477,7 @@ The ElevenLabs post-call webhook delivers the full AI agent transcript (Phase 1)
 | `SERVE_AI_CLIENT_ID` | Yes | ServeAI Basic Auth client ID |
 | `SERVE_AI_CLIENT_SECRET` | Yes | ServeAI Basic Auth client secret |
 | `STT_PROVIDER` | No | **Optional local override** for the STT leg (`elevenlabs`/`speaches`/`sherpa`/`sensevoice`). Selection is normally per-call via ServeAI `phoneCallConfig.liveKitSTT`; this only applies when the config omits it. Also warm-preloads sherpa/SenseVoice in prewarm when set. |
-| `TTS_PROVIDER` | No | **Optional local override** for the TTS leg (`elevenlabs`/`speaches`/`chatterbox`). Selection is normally per-call via ServeAI `phoneCallConfig.liveKitTTS`; this only applies when the config omits it. |
+| `TTS_PROVIDER` | No | **Optional local override** for the TTS leg (`elevenlabs`/`speaches`/`chatterbox`/`voxcpm`/`pocket`). Selection is normally per-call via ServeAI `phoneCallConfig.liveKitTTS`; this only applies when the config omits it. |
 | `SPEACHES_BASE_URL` | If `speaches` | Speaches OpenAI API base — **must end in `/v1`** (e.g. `http://localhost:8000/v1`) |
 | `SPEACHES_API_KEY` | No | Speaches auth token; any non-empty string (e.g. `speaches`) unless auth is enabled |
 | `SPEACHES_STT_MODEL` | If STT `speaches` | Whisper model ID (e.g. `Systran/faster-whisper-base`) |
@@ -452,6 +488,10 @@ The ElevenLabs post-call webhook delivers the full AI agent transcript (Phase 1)
 | `CHATTERBOX_API_KEY` | No | Dummy token; Chatterbox has no auth (any string, e.g. `chatterbox`) |
 | `CHATTERBOX_TTS_MODEL` | If TTS `chatterbox` | Model name in the request (e.g. `chatterbox-turbo`); the loaded model is fixed server-side |
 | `CHATTERBOX_TTS_VOICE` | If TTS `chatterbox` | Predefined-voice **filename**, must include `.wav` (e.g. `Emily.wav`) |
+| `POCKET_BASE_URL` | If TTS `pocket` | Pocket server OpenAI API base — **must end in `/v1`** (e.g. `http://localhost:49112/v1`) |
+| `POCKET_API_KEY` | No | Dummy token; the Pocket server has no auth (any string, e.g. `pocket`) |
+| `POCKET_TTS_MODEL` | No | Model name in the request (default `pocket-tts`); ignored server-side |
+| `POCKET_TTS_VOICE` | If TTS `pocket` | Built-in voice name (`alba`, …) or a cloned-voice filename in the server's voices dir |
 | `SHERPA_STT_MODEL_TYPE` | No | `transducer` (zipformer, default) or `paraformer` (FunASR zh-en; encoder+decoder, no joiner) |
 | `SHERPA_STT_MODEL_DIR` | If STT `sherpa` | Folder holding the extracted streaming model (path from project root) |
 | `SHERPA_STT_ENCODER` / `_DECODER` / `_JOINER` / `_TOKENS` | No | Model filenames within the dir (defaults are type-aware; paraformer ignores `_JOINER`) |

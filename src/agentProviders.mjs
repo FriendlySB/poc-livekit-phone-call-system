@@ -5,7 +5,7 @@
  * can be swapped independently, for A/B-ing latency/quality/cost:
  *
  *   STT_PROVIDER = elevenlabs | speaches | sherpa | sensevoice   (default elevenlabs)
- *   TTS_PROVIDER = elevenlabs | speaches | chatterbox | voxcpm   (default elevenlabs)
+ *   TTS_PROVIDER = elevenlabs | speaches | chatterbox | voxcpm | pocket   (default elevenlabs)
  *
  * STT options: ElevenLabs (cloud streaming), Speaches (self-hosted Whisper, BATCH via
  * StreamAdapter), sherpa-onnx (self-hosted STREAMING, in-process — see sherpaStt.mjs), or
@@ -13,7 +13,9 @@
  * sherpa/sensevoice TTS; both are STT-only and the TTS leg is unaffected by them.
  * TTS options: ElevenLabs (cloud), Speaches/Kokoro (self-hosted, OpenAI-compatible),
  * Chatterbox (self-hosted, wav-only OpenAI endpoint — custom client, see chatterboxTts.mjs),
- * or VoxCPM 1.5 (self-hosted nano-vLLM-VoxCPM, raw-PCM /generate — custom client, see voxcpmTts.mjs).
+ * VoxCPM 1.5 (self-hosted nano-vLLM-VoxCPM, raw-PCM /generate — custom client, see voxcpmTts.mjs),
+ * or Pocket TTS (self-hosted Kyutai 100M CPU model behind its community OpenAI-compatible
+ * server — 24 kHz PCM, so it reuses the stock openai.TTS path like Speaches; no custom client).
  */
 
 import { stt } from "@livekit/agents";
@@ -94,6 +96,19 @@ export function createTts(env) {
     });
   }
 
+  if (env.TTS_PROVIDER === "pocket") {
+    // Self-hosted Kyutai Pocket TTS behind its community OpenAI-compatible server
+    // (POST /v1/audio/speech). It serves 24 kHz mono PCM — the exact shape the stock
+    // openai.TTS plugin expects — so, unlike Chatterbox/VoxCPM, no custom client is needed.
+    // Runs on CPU, freeing the GPU for STT. Passed as-is (framework auto-wraps per-sentence).
+    return new openai.TTS({
+      baseURL: env.POCKET_BASE_URL,
+      apiKey: env.POCKET_API_KEY || "pocket", // server needs no auth; any non-empty string works
+      model: env.POCKET_TTS_MODEL || "pocket-tts", // ignored server-side
+      voice: env.POCKET_TTS_VOICE, // built-in voice name (e.g. "alba") or a cloned-voice filename
+    });
+  }
+
   // Default: ElevenLabs multilingual TTS (own key), unchanged from before.
   return new elevenlabs.TTS({
     apiKey: env.ELEVENLABS_API_KEY,
@@ -136,6 +151,41 @@ export async function warmSpeachesTts(env) {
         input: "warm up",
         model: env.SPEACHES_TTS_MODEL,
         voice: env.SPEACHES_TTS_VOICE,
+        response_format: "pcm",
+      }),
+    });
+  } catch {
+    // ignore — lazy load on first real synth is the fallback
+  }
+}
+
+/**
+ * Pre-load the Pocket TTS model before the agent speaks its greeting.
+ *
+ * Same rationale as warmSpeachesTts: the community Pocket server cold-loads the model on
+ * its first request, which can exceed the voice pipeline's ~10s first-frame timeout and
+ * silence the greeting. A one-shot request here loads it up front (no timeout on this
+ * call); a warm server returns in ~tens of ms, so the per-call cost is negligible.
+ *
+ * Best-effort: any failure (server down, etc.) is swallowed — the call still proceeds and
+ * the model loads lazily on first real synth.
+ *
+ * @param {NodeJS.ProcessEnv} env
+ */
+export async function warmPocketTts(env) {
+  const base = env.POCKET_BASE_URL?.replace(/\/$/, "");
+  if (!base) return;
+  try {
+    await fetch(`${base}/audio/speech`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${env.POCKET_API_KEY || "pocket"}`,
+      },
+      body: JSON.stringify({
+        input: "warm up",
+        model: env.POCKET_TTS_MODEL || "pocket-tts",
+        voice: env.POCKET_TTS_VOICE,
         response_format: "pcm",
       }),
     });

@@ -39,6 +39,10 @@ const baseEnv = {
   CHATTERBOX_TTS_VOICE: "Emily.wav",
   // No VOXCPM_VOICE_FILE here -> VoxcpmTTS falls back to zero-shot silently (no file read).
   VOXCPM_BASE_URL: "http://localhost:8001",
+  POCKET_BASE_URL: "http://localhost:49112/v1",
+  POCKET_API_KEY: "pocket",
+  POCKET_TTS_MODEL: "pocket-tts",
+  POCKET_TTS_VOICE: "alba",
 };
 
 // A real (but un-started) local VAD for the STT adapter; native model loads lazily
@@ -84,6 +88,14 @@ test("TTS_PROVIDER=voxcpm -> custom VoxcpmTTS (not the openai plugin), 44.1kHz m
   assert.ok(t instanceof VoxcpmTTS);
   assert.equal(t.capabilities.streaming, false);
   assert.equal(t.sampleRate, 44100);
+  assert.equal(t.numChannels, 1);
+});
+
+test("TTS_PROVIDER=pocket -> stock OpenAI TTS (Pocket's server is 24kHz PCM, so no custom client)", () => {
+  const t = createTts({ ...baseEnv, TTS_PROVIDER: "pocket" });
+  assert.ok(t instanceof openai.TTS);
+  assert.equal(t.capabilities.streaming, false);
+  assert.equal(t.sampleRate, 24000);
   assert.equal(t.numChannels, 1);
 });
 

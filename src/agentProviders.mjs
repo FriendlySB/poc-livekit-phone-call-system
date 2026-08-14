@@ -5,7 +5,8 @@
  * can be swapped independently, for A/B-ing latency/quality/cost:
  *
  *   STT_PROVIDER = elevenlabs | speaches | sherpa | sensevoice   (default elevenlabs)
- *   TTS_PROVIDER = elevenlabs | speaches | chatterbox | voxcpm | pocket   (default elevenlabs)
+ *   TTS_PROVIDER = elevenlabs | speaches | chatterbox | voxcpm | pocket | vibevoice
+ *                                                                        (default elevenlabs)
  *
  * STT options: ElevenLabs (cloud streaming), Speaches (self-hosted Whisper, BATCH via
  * StreamAdapter), sherpa-onnx (self-hosted STREAMING, in-process — see sherpaStt.mjs), or
@@ -14,8 +15,10 @@
  * TTS options: ElevenLabs (cloud), Speaches/Kokoro (self-hosted, OpenAI-compatible),
  * Chatterbox (self-hosted, wav-only OpenAI endpoint — custom client, see chatterboxTts.mjs),
  * VoxCPM 1.5 (self-hosted nano-vLLM-VoxCPM, raw-PCM /generate — custom client, see voxcpmTts.mjs),
- * or Pocket TTS (self-hosted Kyutai 100M CPU model behind its community OpenAI-compatible
- * server — 24 kHz PCM, so it reuses the stock openai.TTS path like Speaches; no custom client).
+ * Pocket TTS (self-hosted Kyutai 100M CPU model behind its community OpenAI-compatible
+ * server — 24 kHz PCM, so it reuses the stock openai.TTS path like Speaches; no custom client),
+ * or VibeVoice-Realtime (self-hosted Microsoft 0.5B GPU model behind our own thin OpenAI shim,
+ * VibeVoice/demo/openai_server.py — also 24 kHz PCM, so likewise no custom client).
  */
 
 import { stt } from "@livekit/agents";
@@ -109,6 +112,19 @@ export function createTts(env) {
     });
   }
 
+  if (env.TTS_PROVIDER === "vibevoice") {
+    // Self-hosted VibeVoice-Realtime-0.5B (Microsoft) behind our own thin OpenAI shim
+    // (VibeVoice/demo/openai_server.py), which wraps the model's native 24 kHz mono PCM in
+    // POST /v1/audio/speech — so the stock openai.TTS plugin drives it directly, no custom
+    // client. Voice is a fixed preset name (no cloning); see the README for the list.
+    return new openai.TTS({
+      baseURL: env.VIBEVOICE_BASE_URL,
+      apiKey: env.VIBEVOICE_API_KEY || "vibevoice", // shim has no auth; any non-empty string works
+      model: env.VIBEVOICE_TTS_MODEL || "vibevoice-realtime", // ignored server-side
+      voice: env.VIBEVOICE_TTS_VOICE, // preset stem, e.g. "en-Emma_woman"
+    });
+  }
+
   // Default: ElevenLabs multilingual TTS (own key), unchanged from before.
   return new elevenlabs.TTS({
     apiKey: env.ELEVENLABS_API_KEY,
@@ -191,5 +207,41 @@ export async function warmPocketTts(env) {
     });
   } catch {
     // ignore — lazy load on first real synth is the fallback
+  }
+}
+
+/**
+ * Pre-warm VibeVoice before the agent speaks its greeting.
+ *
+ * The shim loads the model at boot, so this isn't a model-load wait like Speaches —
+ * it's the first CUDA/diffusion pass, which pays kernel warmup (same reason Chatterbox
+ * and VoxCPM need one). Doing it here keeps that cost off the greeting, which the
+ * pipeline would otherwise cut off on its first-frame timeout.
+ *
+ * Best-effort: any failure (shim down, etc.) is swallowed — the call still proceeds.
+ *
+ * @param {NodeJS.ProcessEnv} env
+ */
+export async function warmVibevoiceTts(env) {
+  const base = env.VIBEVOICE_BASE_URL?.replace(/\/$/, "");
+  if (!base) return;
+  try {
+    await fetch(`${base}/audio/speech`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${env.VIBEVOICE_API_KEY || "vibevoice"}`,
+      },
+      body: JSON.stringify({
+        // VibeVoice is documented as unstable on inputs of three words or fewer, so the
+        // warm-up line is deliberately longer than the other providers' "warm up".
+        input: "Warming up the speech model.",
+        model: env.VIBEVOICE_TTS_MODEL || "vibevoice-realtime",
+        voice: env.VIBEVOICE_TTS_VOICE,
+        response_format: "pcm",
+      }),
+    });
+  } catch {
+    // ignore — lazy warmup on first real synth is the fallback
   }
 }

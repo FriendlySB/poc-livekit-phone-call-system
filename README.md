@@ -356,6 +356,52 @@ fires a **warm-up** synthesis before the greeting so the CPU model load doesn't 
 - **English-only** at present. **Third-party server** (community repo, MIT) — runs local-only. `POCKET_BASE_URL`
   must end in `/v1`.
 
+## Self-Hosted TTS (VibeVoice-Realtime)
+
+`TTS_PROVIDER=vibevoice` drives **self-hosted [VibeVoice-Realtime-0.5B](https://github.com/microsoft/VibeVoice)**
+(Microsoft, MIT weights) — a 0.5B streaming TTS that needs only **~2.5 GB VRAM**, far less than
+Chatterbox/VoxCPM. **R&D only** (see caveats). **TTS only** — STT is unaffected.
+
+Upstream ships **no OpenAI-compatible server** (just a websocket demo), and the community Docker
+server needs CUDA 13 / driver ≥ 580. So this repo's integration uses a **thin shim we wrote**,
+`VibeVoice/demo/openai_server.py`, which reuses the demo's own `StreamingTTSService` and exposes the
+model's native **24 kHz mono PCM** at `POST /v1/audio/speech`. That's what the stock `openai.TTS`
+plugin expects, so — as with Speaches/Pocket — there's **no custom client** in `src/`.
+
+### 1. Run the shim
+The VibeVoice checkout lives **outside this repo** (sibling clone). One-time setup:
+```powershell
+cd ../VibeVoice
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+pip install --upgrade pip                                   # bundled pip 23 rejects newer wheel metadata
+pip install "torch==2.8.*" "torchaudio==2.8.*" --index-url https://download.pytorch.org/whl/cu128
+pip install -e ".[streamingtts]"
+```
+Then start it (loads the model at boot; `Ctrl+C` to stop):
+```powershell
+python demo\openai_server.py --port 8020
+```
+Interactive docs at <http://localhost:8020/docs>; voices at `GET /v1/audio/voices`.
+
+### 2. Point the agent at VibeVoice
+Set `TTS_PROVIDER=vibevoice` and the `VIBEVOICE_*` vars in `.env`, then `npm run agent`. The worker
+fires a **warm-up** synthesis before the greeting (first CUDA/diffusion pass pays kernel warmup).
+
+### Notes & caveats
+- **No voice cloning.** Voices are fixed presets — `en-Carter_man`, `en-Davis_man`, `en-Emma_woman`,
+  `en-Frank_man`, `en-Grace_woman`, `en-Mike_man`. The branded ElevenLabs voice is **not** reproducible
+  here. The shim returns **400** on an unknown voice rather than silently substituting a default
+  (upstream's fallback once turned a typo into a German voice).
+- **Research license.** Microsoft: *"We do not recommend using VibeVoice in commercial or real-world
+  applications without further testing"* — and they pulled the original repo once over misuse. Fine for
+  A/B research; **not** a basis for a client-facing demo.
+- **Don't run the shim and the GUI demo together** — each loads its own copy of the model (~2.5 GB VRAM).
+- **Quality/speed knobs** are env vars on the shim: `CFG_SCALE` (1.5) and `INFERENCE_STEPS` (5; the
+  model config's own default is 20 — cleaner but slower).
+- **No flash-attn needed** (it isn't a dependency); the model falls back to SDPA automatically.
+- English-only; unstable on inputs of ≤3 words. `VIBEVOICE_BASE_URL` must end in `/v1`.
+
 ## API Endpoints
 
 ### Twilio Webhooks (`/api/phone-call/twilio`)
@@ -492,6 +538,10 @@ The ElevenLabs post-call webhook delivers the full AI agent transcript (Phase 1)
 | `POCKET_API_KEY` | No | Dummy token; the Pocket server has no auth (any string, e.g. `pocket`) |
 | `POCKET_TTS_MODEL` | No | Model name in the request (default `pocket-tts`); ignored server-side |
 | `POCKET_TTS_VOICE` | If TTS `pocket` | Built-in voice name (`alba`, …) or a cloned-voice filename in the server's voices dir |
+| `VIBEVOICE_BASE_URL` | If TTS `vibevoice` | VibeVoice shim OpenAI API base — **must end in `/v1`** (e.g. `http://localhost:8020/v1`) |
+| `VIBEVOICE_API_KEY` | No | Dummy token; the shim has no auth (any string, e.g. `vibevoice`) |
+| `VIBEVOICE_TTS_MODEL` | No | Model name in the request (default `vibevoice-realtime`); ignored server-side |
+| `VIBEVOICE_TTS_VOICE` | If TTS `vibevoice` | Fixed preset stem, e.g. `en-Emma_woman` (no cloning; unknown names 400) |
 | `SHERPA_STT_MODEL_TYPE` | No | `transducer` (zipformer, default) or `paraformer` (FunASR zh-en; encoder+decoder, no joiner) |
 | `SHERPA_STT_MODEL_DIR` | If STT `sherpa` | Folder holding the extracted streaming model (path from project root) |
 | `SHERPA_STT_ENCODER` / `_DECODER` / `_JOINER` / `_TOKENS` | No | Model filenames within the dir (defaults are type-aware; paraformer ignores `_JOINER`) |

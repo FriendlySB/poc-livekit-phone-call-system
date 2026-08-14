@@ -43,6 +43,10 @@ const baseEnv = {
   POCKET_API_KEY: "pocket",
   POCKET_TTS_MODEL: "pocket-tts",
   POCKET_TTS_VOICE: "alba",
+  VIBEVOICE_BASE_URL: "http://localhost:8020/v1",
+  VIBEVOICE_API_KEY: "vibevoice",
+  VIBEVOICE_TTS_MODEL: "vibevoice-realtime",
+  VIBEVOICE_TTS_VOICE: "en-Emma_woman",
 };
 
 // A real (but un-started) local VAD for the STT adapter; native model loads lazily
@@ -97,6 +101,23 @@ test("TTS_PROVIDER=pocket -> stock OpenAI TTS (Pocket's server is 24kHz PCM, so 
   assert.equal(t.capabilities.streaming, false);
   assert.equal(t.sampleRate, 24000);
   assert.equal(t.numChannels, 1);
+});
+
+test("TTS_PROVIDER=vibevoice -> stock OpenAI TTS (our shim serves 24kHz PCM, so no custom client)", () => {
+  const t = createTts({ ...baseEnv, TTS_PROVIDER: "vibevoice" });
+  assert.ok(t instanceof openai.TTS);
+  assert.equal(t.capabilities.streaming, false);
+  assert.equal(t.sampleRate, 24000);
+  assert.equal(t.numChannels, 1);
+});
+
+test("TTS providers that share openai.TTS still point at their own servers", () => {
+  // All three OpenAI-shaped legs build the same class, so the thing worth pinning is that
+  // each reads its OWN base URL — a copy-paste slip would silently send VibeVoice text to
+  // Speaches (both would return valid audio, in the wrong voice).
+  assert.equal(createTts({ ...baseEnv, TTS_PROVIDER: "speaches" }).provider, "localhost:8000");
+  assert.equal(createTts({ ...baseEnv, TTS_PROVIDER: "pocket" }).provider, "localhost:49112");
+  assert.equal(createTts({ ...baseEnv, TTS_PROVIDER: "vibevoice" }).provider, "localhost:8020");
 });
 
 test("legs are independent: Speaches TTS keeps ElevenLabs STT", () => {

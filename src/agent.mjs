@@ -45,7 +45,15 @@ import "dotenv/config";
 import chatbotService from "./services/chatbotService.js";
 import { createPersistQueue } from "./persistQueue.mjs";
 // STT/TTS are chosen per-env (ElevenLabs default | self-hosted Speaches) — see agentProviders.mjs.
-import { createStt, createTts, warmSpeachesTts, warmChatterboxTts, warmVoxcpmTts, warmPocketTts } from "./agentProviders.mjs";
+import {
+  createStt,
+  createTts,
+  warmSpeachesTts,
+  warmChatterboxTts,
+  warmVoxcpmTts,
+  warmPocketTts,
+  warmVibevoiceTts,
+} from "./agentProviders.mjs";
 // ServeAI knowledge/appointment tools exposed to the LLM — see agentTools.mjs.
 import { createServeAiTools } from "./agentTools.mjs";
 // Offline SenseVoice model preloader (in-process; loaded in prewarm) — see senseVoiceStt.mjs.
@@ -231,8 +239,8 @@ export default defineAgent({
       room: ctx.room,
     });
     // Self-hosted TTS pays a cold-start on its first synthesis (Kokoro ~6s model load;
-    // Chatterbox/VoxCPM CUDA-kernel warmup; Pocket CPU model load). Warm it now so the
-    // greeting below isn't cut off by the pipeline's first-frame timeout. No-op for ElevenLabs.
+    // Chatterbox/VoxCPM/VibeVoice CUDA-kernel warmup; Pocket CPU model load). Warm it now so
+    // the greeting below isn't cut off by the pipeline's first-frame timeout. No-op for ElevenLabs.
     if (ttsEnv.TTS_PROVIDER === "speaches") {
       await warmSpeachesTts(ttsEnv);
     } else if (ttsEnv.TTS_PROVIDER === "chatterbox") {
@@ -241,6 +249,8 @@ export default defineAgent({
       await warmVoxcpmTts(ttsEnv);
     } else if (ttsEnv.TTS_PROVIDER === "pocket") {
       await warmPocketTts(ttsEnv);
+    } else if (ttsEnv.TTS_PROVIDER === "vibevoice") {
+      await warmVibevoiceTts(ttsEnv);
     }
     await session.say(greeting || "Hello, how can I help you?", {
       allowInterruptions: false,

@@ -411,8 +411,14 @@ fires a **warm-up** synthesis before the greeting (first CUDA/diffusion pass pay
 | `POST` | `/incoming-call` | Twilio webhook — handles all inbound calls, routes to the configured provider |
 | `POST` | `/call-status` | Twilio call status updates |
 | `POST` | `/conference-events` | Conference participant events (OpenAI human agent transfer) |
-| `POST` | `/transfer-conference-events` | Conference events for ElevenLabs human agent transfer conferences |
+| `POST` | `/transfer-conference-events` | Conference events for ElevenLabs **and** LiveKit human agent transfer conferences |
 | `POST` | `/stream-status` | Media stream status callbacks (acknowledged, not processed) |
+| `POST` | `/outbound-call` | **Place an outbound call** (LiveKit path) — `{ to, instruction?, greeting? }` |
+| `POST` | `/outbound-answer` | Twilio fetches this when the callee **answers**; returns the bridge TwiML |
+| `POST` | `/transfer-to-human` | Cold handoff to a human agent — `{ callSid, chatflowId?, callerNumber }` |
+| `POST` | `/human-transfer-status` | Twilio status callback for the human agent's leg (LiveKit path) |
+
+Ready-made requests for the outbound + takeover endpoints live in [`src/http/outbound.http`](src/http/outbound.http).
 
 ### ElevenLabs Webhooks (`/api/phone-call/elevenlabs`)
 
@@ -493,6 +499,31 @@ Tools for the ElevenLabs agent must be pre-configured on the ElevenLabs agent da
 
 The ElevenLabs post-call webhook delivers the full AI agent transcript (Phase 1). If a human agent transfer occurred, the live transcription messages (Phase 2) are held in a buffer and only flushed to ServeAI after the Phase 1 transcript insert completes, ensuring messages appear in the correct chronological order in the chat history.
 
+### 7. Outbound Calls (LiveKit path)
+
+Requires `LIVEKIT_MODE=selfhost` and a running agent worker. No SIP, no trunk — outbound reuses the same Media Streams bridge as inbound.
+
+1. `POST /outbound-call` fetches the ServeAI config, stashes this call's settings under a random token, and dials via Twilio with a `url` (**not** inline `twiml`).
+2. Twilio rings the contact. Nothing else happens yet — **no room, no agent, no greeting**.
+3. On answer, Twilio fetches `/outbound-answer?token=…`, which returns the same `<Connect><Stream>` TwiML the inbound path returns.
+4. The bridge dispatches the agent with this call's metadata and the agent speaks its greeting.
+
+Because the TwiML is fetched on answer, the agent can never greet a ringing phone — which is why `src/agent.mjs` needed no changes and cannot tell the two directions apart. `instruction` and `greeting` override the ServeAI values per call; `chatflowId` and the `liveKitSTT`/`liveKitTTS` legs always come from ServeAI, so outbound calls keep the full tool set.
+
+### 8. Human Agent Escalation (LiveKit)
+
+A **cold** handoff — the human connects directly to the caller with no briefing, and the agent leaves.
+
+1. The agent's LLM calls the `transferToHumanAgent` tool, which POSTs to `/transfer-to-human` over loopback. (The agent worker is a separate process, and Twilio's status callbacks land on Express, so the transfer state machine has to live there.)
+2. The server dials `humanAgentPhoneNumber` into a waiting conference and waits up to `humanAgentTimeout` seconds.
+3. On answer, the caller's leg is redirected into that conference. **That redirect terminates the `<Connect><Stream>`**, so the bridge closes and the agent job shuts down — its shutdown callback flushes the ServeAI transcript on the way out.
+4. Both legs are forked with `<Start><Stream>` (unidirectional, which is why it can coexist with `<Dial><Conference>`) and transcribed into the **same** ServeAI chatroom, the caller's turns as `user` and the human's as `humanAgent`.
+5. On no-answer the human's leg is cancelled, the tool raises a `ToolError`, and the agent apologises and carries on.
+
+The transcriber is selectable via `CONFERENCE_STT_PROVIDER`: `openai` (default, cloud `gpt-4o-transcribe`) or `speaches` (local turbo Whisper). Both speak the OpenAI Realtime protocol, so the switch only changes URL, auth, and audio encoding — and server-side VAD comes from the endpoint either way.
+
+> **Chatroom seeding.** `insertUserMessage` resolves the chat session *without* the phone number, and Express's session cache is always cold here (the AI half was persisted by the agent worker, a different process). `humanTransferService` therefore seeds `getChatId(callSid, chatflowId, callerNumber)` **with** the number before any insert. Skip that and the human conversation silently lands in a second chatroom.
+
 ## Architecture
 
 ### Key Components
@@ -502,7 +533,11 @@ The ElevenLabs post-call webhook delivers the full AI agent transcript (Phase 1)
 | `twilioController.js` | Inbound call routing; conference event handling; human agent stream setup |
 | `elevenLabsService.js` | ElevenLabs register-call; tool webhook dispatch; human agent transfer; transcript insertion |
 | `openAIRealtimeService.js` | OpenAI webhook handling; WebSocket lifecycle; tool call dispatch |
-| `twilioStreamService.js` | WebSocket handler for Twilio Media Streams; routes audio to OpenAI Realtime transcription |
+| `twilioStreamService.js` | WebSocket handler for Twilio Media Streams; routes conference audio to the transcriber |
+| `conferenceTranscriber.js` | Realtime transcription for human-agent conferences — `openai` (cloud) or `speaches` (local) |
+| `outboundCallService.js` | Places outbound calls; holds per-call config until the callee answers |
+| `humanTransferService.js` | Cold human-agent handoff for the LiveKit path — dial, redirect, fork both legs |
+| `bridgeTwiml.js` | Builds the `<Connect><Stream>` bridge TwiML shared by the inbound and outbound paths |
 | `chatbotService.js` | ServeAI API client — session management, message sending, chat history insertion |
 | `configurationService.js` | Fetches call settings (prompt, provider, chatflowId, human agent config) from ServeAI |
 
@@ -524,6 +559,37 @@ The ElevenLabs post-call webhook delivers the full AI agent transcript (Phase 1)
 | `SERVE_AI_CLIENT_SECRET` | Yes | ServeAI Basic Auth client secret |
 | `STT_PROVIDER` | No | **Optional local override** for the STT leg (`elevenlabs`/`speaches`/`sherpa`/`sensevoice`). Selection is normally per-call via ServeAI `phoneCallConfig.liveKitSTT`; this only applies when the config omits it. Also warm-preloads sherpa/SenseVoice in prewarm when set. |
 | `TTS_PROVIDER` | No | **Optional local override** for the TTS leg (`elevenlabs`/`speaches`/`chatterbox`/`voxcpm`/`pocket`). Selection is normally per-call via ServeAI `phoneCallConfig.liveKitTTS`; this only applies when the config omits it. |
+| `TWILIO_NUMBER` | For outbound | Caller ID used for outbound calls and for dialing the human agent |
+| `HUMAN_AGENT_NUMBER` | No | Fallback human agent number; ServeAI `humanAgentPhoneNumber` takes precedence |
+| `CONFERENCE_STT_PROVIDER` | No | Transcriber for the post-handoff conference: `openai` (default) or `speaches` |
+| `CONFERENCE_STT_LANGUAGE` | No | ISO language code for conference transcription (default `en`); applies to both providers |
+| `CONFERENCE_OPENAI_MODEL` | No | Realtime model for the `openai` transcriber (default `gpt-realtime-mini`) |
+| `CONFERENCE_OPENAI_TRANSCRIBE_MODEL` | No | Transcription model for the `openai` transcriber (default `gpt-4o-transcribe`) |
+| `SPEACHES_CONFERENCE_MODEL` | No | Whisper model for the `speaches` transcriber (default `deepdml/faster-whisper-large-v3-turbo-ct2`) |
+
+> **`CONFERENCE_STT_PROVIDER=speaches` requires `LOOPBACK_HOST_URL` on the Speaches container.**
+> Speaches' realtime handler transcribes by calling its own `/v1/audio/transcriptions` through an
+> OpenAI client built with `base_url=f"{config.loopback_host_url}/v1"`. That setting defaults to
+> `None`, so the base URL becomes the literal string `"None/v1"` and every internal request 404s —
+> the WebSocket connects, audio flows, and no transcript ever comes back. Start the container with
+> `-e LOOPBACK_HOST_URL=http://localhost:8000` to fix it.
+>
+> Two further Speaches quirks are handled in `conferenceTranscriber.js`, both of which fail
+> *silently* rather than erroring:
+>
+> - **Audio must be PCM16 @ 24 kHz.** The server reads appended bytes as raw 24 kHz and then
+>   resamples them to the 16 kHz its VAD and Whisper run at, so 24 kHz is the wire rate;
+>   `conferenceTranscriber.js` does the μ-law decode and the 8→24 kHz resample. Send 16 kHz and the
+>   audio is scaled by 2/3 and plays back 1.5× too fast — transcripts still arrive, but they are
+>   nonsense (a 3.6 s sentence came back as `"Thank you."`).
+> - **`turn_detection.create_response` must be `false`.** It defaults to `true`, so after every
+>   transcript Speaches tries to generate a chat reply; with no chat LLM behind it that raises
+>   `InternalServerError` inside the session task group and kills the socket after the *first*
+>   transcript. `?intent=transcription` does not prevent this.
+>
+> `input_audio_format` is never sent (the server rejects it and drops the field), and the
+> `prefix_padding_ms` "unsupported field" error event is expected — Speaches requires the field in a
+> `turn_detection` update but refuses the value, so it is filtered out of the error log.
 | `SPEACHES_BASE_URL` | If `speaches` | Speaches OpenAI API base — **must end in `/v1`** (e.g. `http://localhost:8000/v1`) |
 | `SPEACHES_API_KEY` | No | Speaches auth token; any non-empty string (e.g. `speaches`) unless auth is enabled |
 | `SPEACHES_STT_MODEL` | If STT `speaches` | Whisper model ID (e.g. `Systran/faster-whisper-base`) |

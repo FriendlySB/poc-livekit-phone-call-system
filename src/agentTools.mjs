@@ -1,9 +1,10 @@
 /**
- * ServeAI function tools for the LiveKit agent's LLM.
+ * Function tools for the LiveKit agent's LLM.
  *
  * Gives the cascaded-pipeline LLM the same 6 granular ServeAI tools the ElevenLabs
  * production agent and the OpenAI Realtime service expose, so the model can query
- * the knowledge base and manage appointments mid-call instead of only chatting.
+ * the knowledge base and manage appointments mid-call instead of only chatting, plus
+ * a 7th tool (transferToHumanAgent) for handing the call to a live person.
  * Every tool funnels a natural-language `query` into the existing
  * `chatbotService.sendMessage(callSid, chatflowId, query, callerNumber)` — the same
  * sink the other two providers use — and returns the cleaned answer for the LLM to speak.
@@ -133,17 +134,106 @@ function buildTool(chatbotService, { chatflowId, callSid, callerNumber }, spec) 
 }
 
 /**
- * Build the ServeAI toolset for one call.
+ * Build the human-agent handoff tool.
+ *
+ * WHY THIS CALLS OUR OWN BACKEND INSTEAD OF TWILIO DIRECTLY
+ * --------------------------------------------------------
+ * The transfer is a multi-step state machine: dial the human into a waiting conference,
+ * wait for them to answer (resolved by a Twilio statusCallback), then redirect the
+ * caller's leg. Those callbacks arrive at the Express server, which is a DIFFERENT
+ * process from this agent worker — so the state has to live there. This tool is just a
+ * loopback trigger. See src/services/humanTransferService.js.
+ *
+ * The handoff is cold: redirecting the caller terminates the bridge's <Connect><Stream>,
+ * so this job shuts down and the caller ends up 1:1 with the human. The shutdown callback
+ * in agent.mjs flushes the transcript on the way out.
+ *
+ * WHY THIS RETURNS IMMEDIATELY INSTEAD OF AWAITING THE TRANSFER
+ * ------------------------------------------------------------
+ * The backend blocks until the human answers — up to humanAgentTimeout (40s default).
+ * Awaiting that inside execute() would be wrong twice over:
+ *
+ *   1. The caller hears dead air for the whole dial, since the tool call has to resolve
+ *      before the agent can say anything.
+ *   2. It leaves a function call pending for 40s. If ANYTHING interrupts in that window
+ *      the framework cancels the tool task and returns without submitting tool outputs
+ *      (agent_activity.js, `if (speechHandle.interrupted)`), while the OpenAI Responses
+ *      session — which is stateful server-side — still expects an output for that call.
+ *      The next turn then dies with "No tool output found for function call ...".
+ *
+ * So: fire the request, return a hold message straight away so the agent keeps talking,
+ * and report the outcome out-of-band via session.say(). On success the caller's leg is
+ * redirected, the bridge dies and this job shuts down — nothing more to say.
+ *
+ * @param {{callSid:string, chatflowId:string, callerNumber:string}} ids
+ * @param {typeof fetch} [fetchImpl] - injected for tests
+ */
+function buildTransferTool({ callSid, chatflowId, callerNumber }, fetchImpl = fetch) {
+  return llm.tool({
+    description:
+      "Transfers the caller to a live human agent. Use this only when the caller explicitly asks to speak to a human, or when you cannot help them with the tools available. The transfer ends your part of the conversation.",
+    parameters: {
+      type: "object",
+      properties: {
+        reason: {
+          type: "string",
+          description: "Short reason for the handoff, e.g. 'caller asked for a human'.",
+        },
+      },
+      required: ["reason"],
+      additionalProperties: false,
+    },
+    execute: async ({ reason }, ctx) => {
+      console.log(`[tool:transferToHumanAgent] ${reason}`);
+
+      // Loopback: agent worker and Express run on the same box.
+      const url = `http://localhost:${process.env.PORT || 5000}/api/phone-call/twilio/transfer-to-human`;
+
+      // Deliberately NOT awaited — see the block comment above.
+      fetchImpl(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ callSid, chatflowId, callerNumber }),
+      })
+        .then(async (res) => {
+          const body = await res.json().catch(() => ({}));
+          if (res.ok && body.success) return null; // redirected; this job is shutting down
+          return body.result || "The human agent is not available right now";
+        })
+        .catch((e) => `Could not reach the transfer service: ${e.message}`)
+        .then((failure) => {
+          if (!failure) return;
+          console.error(`[tool:transferToHumanAgent] ${failure}`);
+          // The caller is still with us, so apologise and carry on. Guarded because a
+          // late failure can land after the session has already closed.
+          try {
+            ctx?.session?.say(
+              "I'm sorry, I couldn't reach a human agent right now. Is there anything else I can help you with?",
+            );
+          } catch (err) {
+            console.error("[tool:transferToHumanAgent] could not announce failure:", err.message);
+          }
+        });
+
+      return "Tell the caller you are connecting them to a human agent now, and ask them to hold.";
+    },
+  });
+}
+
+/**
+ * Build the toolset for one call.
  *
  * @param {{sendMessage:Function}} chatbotService - ServeAI client (injected for testability).
  * @param {{chatflowId:string, callSid:string, callerNumber:string}} ids - per-call identity,
  *        captured by closure so every tool queries the caller's own chat session.
+ * @param {{fetchImpl?:typeof fetch}} [deps] - test seam for the transfer tool's HTTP call.
  * @returns {import("@livekit/agents").llm.ToolContext} name -> FunctionTool map for voice.Agent.
  */
-export function createServeAiTools(chatbotService, ids) {
+export function createServeAiTools(chatbotService, ids, deps = {}) {
   const tools = {};
   for (const spec of TOOL_SPECS) {
     tools[spec.name] = buildTool(chatbotService, ids, spec);
   }
+  tools.transferToHumanAgent = buildTransferTool(ids, deps.fetchImpl);
   return tools;
 }

@@ -60,22 +60,18 @@ import { createServeAiTools } from "./agentTools.mjs";
 import { getOfflineRecognizer } from "./senseVoiceStt.mjs";
 
 export default defineAgent({
-  // prewarm runs in the (optionally pre-forked) job process BEFORE entry, so the
-  // LLM's Responses WebSocket is already open when the caller's first turn lands —
-  // the first reply doesn't pay the connection handshake. Stored on proc.userData
-  // and reused in entry. (The LLM and the sherpa STT expose prewarm(); other STT/TTS don't.)
+  // prewarm runs in the (optionally pre-forked) job process BEFORE entry, so anything
+  // expensive and CALL-INDEPENDENT is loaded here rather than on the first turn.
+  //
+  // The LLM is deliberately NOT prewarmed here. Its Responses WebSocket was opened at
+  // fork time and then sat idle until a call arrived — but the plugin's connection pool
+  // only expires sockets by AGE (WS_MAX_SESSION_DURATION = 1 hour) and has no idle
+  // detection. After ~7 minutes idle the socket is silently dropped upstream, the pool
+  // still hands it out, and the request goes into a half-open connection. The failure
+  // surfaces as a close event ~19s later ("OpenAI Responses WebSocket closed
+  // unexpectedly"), so the first turn of any call following an idle gap stalled ~19s
+  // before a single token. The LLM is now built per job in entry() instead; see there.
   prewarm: (proc) => {
-    const llm = new openai.responses.LLM({
-      apiKey: process.env.OPENAI_API_KEY,
-      // gpt-4.1-mini: lower time-to-first-token than gpt-4.1 — the single biggest
-      // chunk of response latency on this stack (~0.95s -> ~0.4-0.5s). This agent is
-      // conversation-only (no tools), so mini's quality is more than sufficient.
-      // Revert to "gpt-4.1" if reply quality regresses.
-      model: process.env.AGENT_LLM_MODEL || "gpt-4.1-mini",
-    });
-    llm.prewarm();
-    proc.userData.llm = llm;
-
     // The in-process STTs (sherpa ~190MB, SenseVoice ~930MB) load an ONNX model that's
     // expensive on the first turn. Provider selection is now per-call (ServeAI liveKitSTT),
     // which prewarm CAN'T see — it runs in the idle process before any call. So we only
@@ -95,6 +91,21 @@ export default defineAgent({
   entry: async (ctx) => {
     // Join the LiveKit room this job was dispatched to.
     await ctx.connect();
+
+    // Built PER JOB, not in prewarm — see the prewarm comment for why a process-level
+    // socket goes stale. prewarm() here is non-blocking: the WebSocket handshake
+    // (~300ms) runs in the background while we parse metadata, build the pipeline, warm
+    // the TTS and speak the greeting (~5s), so it is fully hidden by the time the
+    // caller's first turn lands — the same benefit as before, on a socket that is only
+    // seconds old instead of minutes.
+    const llm = new openai.responses.LLM({
+      apiKey: process.env.OPENAI_API_KEY,
+      // gpt-4.1-mini: lower time-to-first-token than gpt-4.1 — the single biggest
+      // chunk of response latency on this stack (~0.95s -> ~0.4-0.5s).
+      // Revert to "gpt-4.1" if reply quality regresses.
+      model: process.env.AGENT_LLM_MODEL || "gpt-4.1-mini",
+    });
+    llm.prewarm();
 
     // Per-call config from ServeAI, forwarded by the backend as dispatch metadata.
     // Falls back to "{}" so the worker still runs if metadata is ever missing.
@@ -167,8 +178,8 @@ export default defineAgent({
         sttEnv.STT_PROVIDER === "sherpa" && ctx.proc.userData.stt
           ? ctx.proc.userData.stt
           : createStt(sttEnv, sttVad),
-      // LLM orchestrator — reuse the connection prewarmed above
-      llm: ctx.proc.userData.llm,
+      // LLM orchestrator — the per-job instance prewarmed at the top of entry()
+      llm,
       tts: createTts(ttsEnv),
       // Explicit VAD shared with the STT adapter (see above).
       vad: sttVad,
@@ -192,6 +203,16 @@ export default defineAgent({
         endpointing: useBatchStt
           ? { minDelay: 450, maxDelay: 2000 }
           : { minDelay: 300, maxDelay: 1200 },
+        interruption: {
+          // minWords defaults to 0, so a SINGLE word interrupts. Whisper reliably
+          // hallucinates "You" / "Thank you." on short noise segments, and one of those
+          // landing mid-reply aborts the turn — which, if a tool call is in flight, also
+          // cancels it before its output is submitted. The OpenAI Responses session is
+          // stateful server-side, so the next turn then 400s with "No tool output found
+          // for function call ...". Requiring two words filters the hallucinations out.
+          // Cost: a genuine one-word barge-in ("stop") no longer interrupts.
+          minWords: 2,
+        },
       },
     });
 

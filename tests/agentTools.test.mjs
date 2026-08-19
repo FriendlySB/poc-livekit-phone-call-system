@@ -40,10 +40,10 @@ const TOOL_NAMES = [
   "cancelAppointment",
 ];
 
-test("builds exactly the 6 ServeAI tools, each a FunctionTool", () => {
+test("builds the 6 ServeAI tools plus the human handoff, each a FunctionTool", () => {
   const tools = createServeAiTools(makeStub(), IDS);
-  assert.deepEqual(Object.keys(tools).sort(), [...TOOL_NAMES].sort());
-  for (const name of TOOL_NAMES) {
+  assert.deepEqual(Object.keys(tools).sort(), [...TOOL_NAMES, "transferToHumanAgent"].sort());
+  for (const name of [...TOOL_NAMES, "transferToHumanAgent"]) {
     assert.ok(llm.isFunctionTool(tools[name]), `${name} should be a FunctionTool`);
   }
 });
@@ -102,4 +102,130 @@ test("failure from ServeAI surfaces as a ToolError", async () => {
       return true;
     }
   );
+});
+
+// --- transferToHumanAgent -------------------------------------------------------------
+// The tool is a loopback trigger: the real state machine lives in Express (see
+// humanTransferService), so all this must do is POST the call identity and hand the agent
+// something to say. fetch is injected so nothing leaves the process.
+//
+// It must NOT await the transfer. The backend blocks until the human answers (up to 40s);
+// awaiting that leaves a function call pending, and any interruption in that window makes
+// the framework cancel the tool without submitting its output — after which the stateful
+// OpenAI Responses session 400s with "No tool output found for function call ...".
+
+/** Record calls and reply with a canned { status, body }, resolving after `delayMs`. */
+function makeFetchStub(status, body, delayMs = 0) {
+  const calls = [];
+  return {
+    calls,
+    fetchImpl: (url, init) => {
+      calls.push({ url, init });
+      return new Promise((resolve) =>
+        setTimeout(
+          () => resolve({ ok: status >= 200 && status < 300, status, json: async () => body }),
+          delayMs,
+        ),
+      );
+    },
+  };
+}
+
+/** Minimal AgentSession stand-in — the tool reports late failures through say(). */
+function makeCtx() {
+  const said = [];
+  return { said, ctx: { session: { say: (text) => said.push(text) } } };
+}
+
+/** Let the tool's detached promise chain settle. */
+const settle = () => new Promise((r) => setTimeout(r, 20));
+
+test("transferToHumanAgent: posts the call identity the backend needs", async () => {
+  const f = makeFetchStub(200, { success: true, result: "transferred" });
+  const tools = createServeAiTools(makeStub(), IDS, { fetchImpl: f.fetchImpl });
+
+  const out = await tools.transferToHumanAgent.execute({ reason: "caller asked for a human" }, makeCtx().ctx);
+
+  // Returns something for the agent to SAY, not the backend's result — the transfer is
+  // still in flight at this point.
+  assert.match(out, /connecting/i);
+  assert.equal(f.calls.length, 1);
+
+  const { url, init } = f.calls[0];
+  // Loopback, not HOST — agent worker and Express are on the same box.
+  assert.match(url, /^http:\/\/localhost:\d+\/api\/phone-call\/twilio\/transfer-to-human$/);
+  assert.equal(init.method, "POST");
+
+  // callerNumber matters: humanTransferService seeds the ServeAI chatroom with it, and an
+  // unseeded seed would split the transcript into a second chatroom.
+  assert.deepEqual(JSON.parse(init.body), {
+    callSid: IDS.callSid,
+    chatflowId: IDS.chatflowId,
+    callerNumber: IDS.callerNumber,
+  });
+});
+
+test("transferToHumanAgent: returns BEFORE the backend responds", async () => {
+  // The regression guard for the 400. A 300ms backend must not hold the tool call open.
+  const f = makeFetchStub(200, { success: true, result: "transferred" }, 300);
+  const tools = createServeAiTools(makeStub(), IDS, { fetchImpl: f.fetchImpl });
+
+  const started = Date.now();
+  await tools.transferToHumanAgent.execute({ reason: "escalation" }, makeCtx().ctx);
+  const elapsed = Date.now() - started;
+
+  assert.ok(elapsed < 100, `tool should return immediately, took ${elapsed}ms`);
+  assert.equal(f.calls.length, 1, "but the request must still have been sent");
+});
+
+test("transferToHumanAgent: a no-answer is announced to the caller, not thrown", async () => {
+  const f = makeFetchStub(409, { success: false, result: "The human agent did not answer" });
+  const { said, ctx } = makeCtx();
+  const tools = createServeAiTools(makeStub(), IDS, { fetchImpl: f.fetchImpl });
+
+  // Must not reject — the tool already returned, so there is no call left to fail.
+  await tools.transferToHumanAgent.execute({ reason: "escalation" }, ctx);
+  await settle();
+
+  assert.equal(said.length, 1, "the caller must be told the handoff failed");
+  assert.match(said[0], /couldn't reach a human agent/i);
+});
+
+test("transferToHumanAgent: an unreachable backend is announced too, not a crash", async () => {
+  const { said, ctx } = makeCtx();
+  const tools = createServeAiTools(makeStub(), IDS, {
+    fetchImpl: async () => {
+      throw new Error("ECONNREFUSED");
+    },
+  });
+
+  await tools.transferToHumanAgent.execute({ reason: "escalation" }, ctx);
+  await settle();
+
+  assert.equal(said.length, 1);
+});
+
+test("transferToHumanAgent: says nothing on success — the job is shutting down", async () => {
+  const f = makeFetchStub(200, { success: true, result: "transferred" });
+  const { said, ctx } = makeCtx();
+  const tools = createServeAiTools(makeStub(), IDS, { fetchImpl: f.fetchImpl });
+
+  await tools.transferToHumanAgent.execute({ reason: "escalation" }, ctx);
+  await settle();
+
+  // The caller's leg was redirected, so the bridge is gone and so is this session.
+  assert.deepEqual(said, []);
+});
+
+test("transferToHumanAgent: a closed session doesn't crash the late failure path", async () => {
+  const f = makeFetchStub(409, { success: false, result: "nope" });
+  const tools = createServeAiTools(makeStub(), IDS, { fetchImpl: f.fetchImpl });
+
+  // No ctx at all, and a ctx whose say() throws — both must be survivable.
+  await tools.transferToHumanAgent.execute({ reason: "escalation" }, undefined);
+  await tools.transferToHumanAgent.execute(
+    { reason: "escalation" },
+    { session: { say: () => { throw new Error("session closed"); } } },
+  );
+  await settle();
 });

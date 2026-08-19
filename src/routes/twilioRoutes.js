@@ -19,4 +19,16 @@ router.post('/stream-status', (req, res) => {
   res.sendStatus(200);
 });
 
+// Place an outbound call (LiveKit path) — { to, instruction?, greeting? }
+router.post('/outbound-call', twilioController.handleOutboundCall);
+
+// Twilio fetches this when the callee ANSWERS an outbound call; returns the bridge TwiML
+router.post('/outbound-answer', twilioController.handleOutboundAnswer);
+
+// Called by the LiveKit agent's transferToHumanAgent tool — { callSid, chatflowId?, callerNumber }
+router.post('/transfer-to-human', twilioController.handleTransferToHuman);
+
+// Status callback for the human agent's leg during a LiveKit transfer
+router.post('/human-transfer-status', twilioController.handleHumanTransferStatus);
+
 module.exports = router;

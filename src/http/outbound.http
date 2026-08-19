@@ -1,0 +1,52 @@
+# Outbound calling + human agent takeover (LiveKit path).
+#
+# Requires LIVEKIT_MODE=selfhost, a running agent worker (`npm run agent`), and a public
+# HOST tunnel — Twilio fetches the answer webhook and the status callbacks over it.
+#
+# Flow: this endpoint dials, Twilio rings the contact, and ONLY on answer does Twilio fetch
+# /outbound-answer for the bridge TwiML. That is why the agent never greets a ringing phone.
+
+@base_url = http://localhost:5070/api/phone-call/twilio
+@contact = +6281928200568
+# +6281928200568
+
+### Place an outbound call — uses the ServeAI prompt/greeting as-is
+POST {{base_url}}/outbound-call
+Content-Type: application/json
+
+{
+  "to": "{{contact}}"
+}
+
+### Place an outbound call with a per-call instruction and greeting
+# `instruction` replaces the ServeAI prompt for this call only; `greeting` is the first
+# line the agent speaks once the contact picks up. chatflowId and the liveKitSTT/liveKitTTS
+# legs still come from ServeAI config, so the agent keeps its knowledge-base and
+# appointment tools on outbound calls.
+#
+# Response: { "success": true, "callSid": "CAxxxx", "token": "...", "to": "+62..." }
+# Keep the callSid — the transfer endpoint below needs it.
+POST {{base_url}}/outbound-call
+Content-Type: application/json
+
+{
+  "to": "{{contact}}",
+  "greeting": "Hello, I'm calling from Restaurant Entier. Am I speaking with Friendly?"
+}
+
+### Trigger a human takeover manually (normally the agent's transferToHumanAgent tool does this)
+# Dials HUMAN_AGENT_NUMBER (or ServeAI's humanAgentPhoneNumber) into a waiting conference,
+# then redirects the caller in. That redirect ends the LiveKit bridge — a COLD handoff, so
+# the agent leaves. Both legs are then forked to the transcriber and their turns land in
+# the same ServeAI chatroom as the AI half of the call.
+#
+# callerNumber is REQUIRED: it seeds the ServeAI chatroom lookup. Omit it and the human
+# conversation is written to a brand-new chatroom instead of the caller's.
+POST {{base_url}}/transfer-to-human
+Content-Type: application/json
+
+{
+  "callSid": "CAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "chatflowId": "your-chatflow-id",
+  "callerNumber": "6285725868168"
+}

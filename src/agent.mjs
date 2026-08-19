@@ -8,12 +8,16 @@
  * assigns the job here; the worker joins the room and runs a full cascaded
  * STT -> LLM -> TTS voice pipeline so the caller can converse freely.
  *
- *   STT: ElevenLabs scribe_v2_realtime | self-hosted Speaches whisper (STT_PROVIDER)
+ *   STT: ElevenLabs scribe_v2_realtime | Speaches whisper (batch) | sherpa-onnx
+ *        (self-hosted streaming) | SenseVoice (self-hosted offline batch)
  *   LLM: OpenAI gpt-4.1 via the Responses API                — our own key
- *   TTS: ElevenLabs multilingual | self-hosted Speaches Kokoro (TTS_PROVIDER)
+ *   TTS: ElevenLabs multilingual | self-hosted Speaches Kokoro | self-hosted Chatterbox | self-hosted VoxCPM 1.5
  *   VAD: bundled local Silero (inference.VAD), shared by the session + STT adapter
  *
- * STT/TTS provider selection lives in agentProviders.mjs; both default to ElevenLabs.
+ * Provider selection is PER CALL: ServeAI's phoneCallConfig.liveKitSTT/liveKitTTS arrive in the
+ * dispatch metadata and pick each leg (same keys as the createStt/createTts branches). The
+ * process.env.STT_PROVIDER/TTS_PROVIDER vars are now an optional local override/fallback only.
+ * The factories themselves live in agentProviders.mjs; both default to ElevenLabs.
  *
  * The system prompt and the spoken greeting come from ServeAI config, passed
  * per-call as dispatch metadata (ctx.job.metadata), along with chatflowId,
@@ -41,37 +45,82 @@ import "dotenv/config";
 import chatbotService from "./services/chatbotService.js";
 import { createPersistQueue } from "./persistQueue.mjs";
 // STT/TTS are chosen per-env (ElevenLabs default | self-hosted Speaches) — see agentProviders.mjs.
-import { createStt, createTts, warmSpeachesTts } from "./agentProviders.mjs";
+import {
+  createStt,
+  createTts,
+  warmSpeachesTts,
+  warmChatterboxTts,
+  warmVoxcpmTts,
+  warmPocketTts,
+  warmVibevoiceTts,
+} from "./agentProviders.mjs";
 // ServeAI knowledge/appointment tools exposed to the LLM — see agentTools.mjs.
 import { createServeAiTools } from "./agentTools.mjs";
+// Offline SenseVoice model preloader (in-process; loaded in prewarm) — see senseVoiceStt.mjs.
+import { getOfflineRecognizer } from "./senseVoiceStt.mjs";
 
 export default defineAgent({
-  // prewarm runs in the (optionally pre-forked) job process BEFORE entry, so the
-  // LLM's Responses WebSocket is already open when the caller's first turn lands —
-  // the first reply doesn't pay the connection handshake. Stored on proc.userData
-  // and reused in entry. (Only the LLM exposes prewarm(); STT/TTS do not.)
+  // prewarm runs in the (optionally pre-forked) job process BEFORE entry, so anything
+  // expensive and CALL-INDEPENDENT is loaded here rather than on the first turn.
+  //
+  // The LLM is deliberately NOT prewarmed here. Its Responses WebSocket was opened at
+  // fork time and then sat idle until a call arrived — but the plugin's connection pool
+  // only expires sockets by AGE (WS_MAX_SESSION_DURATION = 1 hour) and has no idle
+  // detection. After ~7 minutes idle the socket is silently dropped upstream, the pool
+  // still hands it out, and the request goes into a half-open connection. The failure
+  // surfaces as a close event ~19s later ("OpenAI Responses WebSocket closed
+  // unexpectedly"), so the first turn of any call following an idle gap stalled ~19s
+  // before a single token. The LLM is now built per job in entry() instead; see there.
   prewarm: (proc) => {
-    const llm = new openai.responses.LLM({
-      apiKey: process.env.OPENAI_API_KEY,
-      // gpt-4.1-mini: lower time-to-first-token than gpt-4.1 — the single biggest
-      // chunk of response latency on this stack (~0.95s -> ~0.4-0.5s). This agent is
-      // conversation-only (no tools), so mini's quality is more than sufficient.
-      // Revert to "gpt-4.1" if reply quality regresses.
-      model: process.env.AGENT_LLM_MODEL || "gpt-4.1-mini",
-    });
-    llm.prewarm();
-    proc.userData.llm = llm;
+    // The in-process STTs (sherpa ~190MB, SenseVoice ~930MB) load an ONNX model that's
+    // expensive on the first turn. Provider selection is now per-call (ServeAI liveKitSTT),
+    // which prewarm CAN'T see — it runs in the idle process before any call. So we only
+    // warm-preload here when process.env.STT_PROVIDER is set as a local override/hint; in
+    // that case the model is resident before the first turn (reused in entry). Without the
+    // env hint, a config-selected sherpa/SenseVoice call cold-loads its model on the first
+    // turn — set STT_PROVIDER in .env when specifically A/B-testing those two.
+    if (process.env.STT_PROVIDER === "sherpa") {
+      const sherpaStt = createStt(process.env);
+      sherpaStt.prewarm();
+      proc.userData.stt = sherpaStt;
+    }
+    if (process.env.STT_PROVIDER === "sensevoice") {
+      getOfflineRecognizer(process.env);
+    }
   },
   entry: async (ctx) => {
     // Join the LiveKit room this job was dispatched to.
     await ctx.connect();
 
+    // Built PER JOB, not in prewarm — see the prewarm comment for why a process-level
+    // socket goes stale. prewarm() here is non-blocking: the WebSocket handshake
+    // (~300ms) runs in the background while we parse metadata, build the pipeline, warm
+    // the TTS and speak the greeting (~5s), so it is fully hidden by the time the
+    // caller's first turn lands — the same benefit as before, on a socket that is only
+    // seconds old instead of minutes.
+    const llm = new openai.responses.LLM({
+      apiKey: process.env.OPENAI_API_KEY,
+      // gpt-4.1-mini: lower time-to-first-token than gpt-4.1 — the single biggest
+      // chunk of response latency on this stack (~0.95s -> ~0.4-0.5s).
+      // Revert to "gpt-4.1" if reply quality regresses.
+      model: process.env.AGENT_LLM_MODEL || "gpt-4.1-mini",
+    });
+    llm.prewarm();
+
     // Per-call config from ServeAI, forwarded by the backend as dispatch metadata.
     // Falls back to "{}" so the worker still runs if metadata is ever missing.
     // chatflowId/callSid/callerNumber drive ServeAI chat-history persistence below.
-    const { prompt, greeting, chatflowId, callSid, callerNumber } = JSON.parse(
-      ctx.job.metadata || "{}"
-    );
+    // liveKitSTT/liveKitTTS pick the STT/TTS leg PER CALL (ServeAI phoneCallConfig).
+    const { prompt, greeting, chatflowId, callSid, callerNumber, liveKitSTT, liveKitTTS } =
+      JSON.parse(ctx.job.metadata || "{}");
+
+    // Provider selection is per-call: ServeAI's liveKitSTT/liveKitTTS choose the leg, using
+    // the same keys as the old STT_PROVIDER/TTS_PROVIDER env switches. process.env.* remains an
+    // optional local override/fallback (e.g. testing without ServeAI). Connection configs (base
+    // URLs, models, voices) always come from process.env, so we just override the provider switch
+    // on a shallow copy and pass that to createStt/createTts.
+    const sttEnv = liveKitSTT ? { ...process.env, STT_PROVIDER: liveKitSTT } : process.env;
+    const ttsEnv = liveKitTTS ? { ...process.env, TTS_PROVIDER: liveKitTTS } : process.env;
 
     // ServeAI chat-history persistence (gated on chatflowId
     // Serial, ordered, drop-safe queue (see persistQueue.mjs for the guarantees).
@@ -96,11 +145,12 @@ export default defineAgent({
       });
     }
 
-    // STT (Speaches batch whisper) commits no interim transcripts, so the semantic
-    // end-of-utterance model has nothing incremental to score. In that mode we fall
-    // back to pure VAD turn detection; the ElevenLabs streaming path keeps the better
-    // EOU detector. This flag also widens the turn-grouping timings below.
-    const useSpeachesStt = process.env.STT_PROVIDER === "speaches";
+    // Speaches/Whisper and SenseVoice are BATCH: they commit no interim transcripts, so the
+    // semantic end-of-utterance model has nothing incremental to score. In that mode we fall
+    // back to pure VAD turn detection + a widened turn-grouping window below. The STREAMING
+    // paths (ElevenLabs and sherpa-onnx) emit interim transcripts, so they keep the better
+    // semantic EOU detector and snappier timings.
+    const useBatchStt = ["speaches", "sensevoice"].includes(sttEnv.STT_PROVIDER);
 
     // Bundled, local Silero VAD (no cloud). Shared by the AgentSession (turn-taking
     // / interruption) and, when STT_PROVIDER=speaches, by the STT StreamAdapter that
@@ -115,20 +165,27 @@ export default defineAgent({
     // knob here, since batch STT yields no interim transcripts for a semantic detector.
     const sttVad = new inference.VAD({
       model: "silero",
-      ...(useSpeachesStt ? { minSilenceDuration: 450 } : {}),
+      ...(useBatchStt ? { minSilenceDuration: 450 } : {}),
     });
 
     const session = new voice.AgentSession({
-      // STT/TTS are selected per-env (ElevenLabs default | self-hosted Speaches).
-      stt: createStt(process.env, sttVad),
-      // LLM orchestrator — reuse the connection prewarmed above
-      llm: ctx.proc.userData.llm,
-      tts: createTts(process.env),
+      // STT per-call (sttEnv): ElevenLabs (default) | Speaches batch | sherpa streaming |
+      // SenseVoice offline. sherpa's model is preloaded in prewarm ONLY when process.env picks
+      // it (prewarm can't see per-call metadata) — reuse that warm instance when present, else
+      // build fresh (cold first turn). SenseVoice reuses its module-memoized model the same way.
+      // TTS is independent (createTts, ttsEnv).
+      stt:
+        sttEnv.STT_PROVIDER === "sherpa" && ctx.proc.userData.stt
+          ? ctx.proc.userData.stt
+          : createStt(sttEnv, sttVad),
+      // LLM orchestrator — the per-job instance prewarmed at the top of entry()
+      llm,
+      tts: createTts(ttsEnv),
       // Explicit VAD shared with the STT adapter (see above).
       vad: sttVad,
       // Turn-taking: decide when the caller has finished so we don't reply mid-sentence.
       turnHandling: {
-        turnDetection: useSpeachesStt
+        turnDetection: useBatchStt
           ? // Batch STT -> rely on VAD silence to end the turn.
             "vad"
           : // Lower the end-of-turn confidence threshold (default ~0.56).
@@ -143,9 +200,19 @@ export default defineAgent({
         // Endpointing waits, in ms, since the last detected speech. For batch STT,
         // keep minDelay aligned with the VAD window (above) so the turn doesn't commit
         // before the grouping pause elapses; ElevenLabs streaming STT stays snappy.
-        endpointing: useSpeachesStt
+        endpointing: useBatchStt
           ? { minDelay: 450, maxDelay: 2000 }
           : { minDelay: 300, maxDelay: 1200 },
+        interruption: {
+          // minWords defaults to 0, so a SINGLE word interrupts. Whisper reliably
+          // hallucinates "You" / "Thank you." on short noise segments, and one of those
+          // landing mid-reply aborts the turn — which, if a tool call is in flight, also
+          // cancels it before its output is submitted. The OpenAI Responses session is
+          // stateful server-side, so the next turn then 400s with "No tool output found
+          // for function call ...". Requiring two words filters the hallucinations out.
+          // Cost: a genuine one-word barge-in ("stop") no longer interrupts.
+          minWords: 2,
+        },
       },
     });
 
@@ -192,10 +259,19 @@ export default defineAgent({
       }),
       room: ctx.room,
     });
-    // Speaches/Kokoro cold-loads in ~6s; warm it now so the greeting below doesn't
-    // get cut off by the pipeline's first-frame timeout. No-op for ElevenLabs.
-    if (process.env.TTS_PROVIDER === "speaches") {
-      await warmSpeachesTts(process.env);
+    // Self-hosted TTS pays a cold-start on its first synthesis (Kokoro ~6s model load;
+    // Chatterbox/VoxCPM/VibeVoice CUDA-kernel warmup; Pocket CPU model load). Warm it now so
+    // the greeting below isn't cut off by the pipeline's first-frame timeout. No-op for ElevenLabs.
+    if (ttsEnv.TTS_PROVIDER === "speaches") {
+      await warmSpeachesTts(ttsEnv);
+    } else if (ttsEnv.TTS_PROVIDER === "chatterbox") {
+      await warmChatterboxTts(ttsEnv);
+    } else if (ttsEnv.TTS_PROVIDER === "voxcpm") {
+      await warmVoxcpmTts(ttsEnv);
+    } else if (ttsEnv.TTS_PROVIDER === "pocket") {
+      await warmPocketTts(ttsEnv);
+    } else if (ttsEnv.TTS_PROVIDER === "vibevoice") {
+      await warmVibevoiceTts(ttsEnv);
     }
     await session.say(greeting || "Hello, how can I help you?", {
       allowInterruptions: false,

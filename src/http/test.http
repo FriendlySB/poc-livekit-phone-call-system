@@ -1,15 +1,19 @@
+# The outbound-call sketch that used to live here described POST /start-marketing-call,
+# an endpoint that was never implemented. Outbound calling now exists for real — see
+# outbound.http in this directory for the working requests.
+#
+# The per-contact `instruction` / `greeting` shape sketched here survived: it maps to the
+# body of POST /outbound-call. The `contacts` array (a campaign loop over many numbers)
+# did not — the implemented endpoint dials one contact per request.
+
 @base_url = http://localhost:5000/api/phone-call/twilio
 
-### Create a new outbound call
-POST {{base_url}}/start-marketing-call
+### Place a single outbound call (see outbound.http for the full set)
+POST {{base_url}}/outbound-call
 Content-Type: application/json
 
 {
-  "contacts": [
-    {
-      "phoneNumber": "+6285725868168",
-      "instruction": "You are calling Friendly, the owner of Tolman Sdn Bhd, a construction company. Your tone should be relaxed when talking with this contact.",
-      "greeting": "Hello, may I speak to Friendly, the owner of Tolman Sdn Bhd? This is Sarah calling from Meridian Properties"
-    }
-  ]
+  "to": "+6285725868168",
+  "instruction": "You are calling Friendly, the owner of Tolman Sdn Bhd, a construction company. Your tone should be relaxed when talking with this contact.",
+  "greeting": "Hello, may I speak to Friendly, the owner of Tolman Sdn Bhd? This is Sarah calling from Meridian Properties"
 }

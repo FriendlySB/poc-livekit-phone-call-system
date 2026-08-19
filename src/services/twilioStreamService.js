@@ -1,10 +1,12 @@
-const WebSocket = require("ws");
 const openAIRealtimeService = require("./openAIRealtimeService");
 const elevenLabsService = require("./elevenLabsService");
+const humanTransferService = require("./humanTransferService");
+const chatbotService = require("./chatbotService");
+const { createConferenceTranscriber } = require("./conferenceTranscriber");
 
 class TwilioStreamService {
   constructor() {
-    this.activeStreams = new Map(); // callSid -> { ws, openAiWs, streamSid, participantType, conferenceName }
+    this.activeStreams = new Map(); // callSid -> { ws, transcriber, streamSid, participantType, conferenceName }
   }
 
   /**
@@ -15,7 +17,7 @@ class TwilioStreamService {
 
     let callSid = null;
     let streamSid = null;
-    let openAiWs = null;
+    let transcriber = null;
     let conferenceName = null;
     let participantType = null;
 
@@ -41,6 +43,9 @@ class TwilioStreamService {
           } else {
             // ElevenLabs human agent transfer conference path
             const elevenLabsParticipant = elevenLabsService.getTransferParticipant(callSid);
+            // LiveKit human agent transfer conference path
+            const liveKitParticipant = humanTransferService.getTransferParticipant(callSid);
+
             if (elevenLabsParticipant) {
               conferenceName = elevenLabsParticipant.conferenceName;
               participantType = elevenLabsParticipant.participantType;
@@ -48,6 +53,20 @@ class TwilioStreamService {
               onTranscript = (messageType, transcript) => {
                 elevenLabsService.insertHumanConferenceMessage(conversationId, participantType, transcript)
                   .catch(err => console.error(`Human conference insert error for ${conversationId}:`, err.message));
+              };
+            } else if (liveKitParticipant) {
+              conferenceName = liveKitParticipant.conferenceName;
+              participantType = liveKitParticipant.participantType;
+              const { chatCallSid, chatflowId, queue } = liveKitParticipant;
+              // Both legs share ONE queue, so caller and human turns land in submission
+              // order. chatCallSid is the CALLER's sid on both legs — that is what the
+              // ServeAI chatroom is keyed to (the human's leg has its own, unrelated sid).
+              onTranscript = (messageType, transcript) => {
+                queue.persist(() =>
+                  messageType === "user"
+                    ? chatbotService.insertUserMessage(chatCallSid, chatflowId, transcript)
+                    : chatbotService.insertBotMessage(chatCallSid, chatflowId, transcript, "humanAgent")
+                );
               };
             } else {
               console.error(`No conference found for callSid: ${callSid} — closing stream`);
@@ -63,12 +82,13 @@ class TwilioStreamService {
             participantType,
           });
 
-          // Create OpenAI Realtime transcription session
-          openAiWs = await this.createRealtimeTranscriber(callSid, conferenceName, participantType, onTranscript);
+          // Open the transcription session. Provider is OpenAI cloud by default; set
+          // CONFERENCE_STT_PROVIDER=speaches for the local turbo Whisper instead.
+          transcriber = createConferenceTranscriber({ participantType, onTranscript });
 
           this.activeStreams.set(callSid, {
             ws,
-            openAiWs,
+            transcriber,
             streamSid,
             conferenceName,
             participantType,
@@ -77,19 +97,12 @@ class TwilioStreamService {
           break;
 
         case "media":
-          if (!openAiWs || openAiWs.readyState !== WebSocket.OPEN) return;
-
-          const audioAppend = {
-            type: "input_audio_buffer.append",
-            audio: msg.media.payload,
-          };
-
-          openAiWs.send(JSON.stringify(audioAppend));
+          transcriber?.push(msg.media.payload);
           break;
 
         case "stop":
           console.log("Media stream stop", callSid);
-          if (openAiWs) openAiWs.close();
+          transcriber?.close();
           this.activeStreams.delete(callSid);
           break;
       }
@@ -97,94 +110,13 @@ class TwilioStreamService {
 
     ws.on("close", () => {
       console.log(`${participantType || 'Unknown'} MediaStream WS closed`);
-      if (openAiWs) openAiWs.close();
+      transcriber?.close();
       if (callSid) this.activeStreams.delete(callSid);
     });
 
     ws.on("error", (error) => {
       console.error(`MediaStream WS error for ${participantType}:`, error);
     });
-  }
-
-  /**
-   * Create a Realtime session for transcription-only
-   */
-  async createRealtimeTranscriber(callSid, conferenceName, participantType, onTranscript) {
-    const wsUrl = `wss://api.openai.com/v1/realtime?model=gpt-realtime-mini`;
-
-    const openAiWs = new WebSocket(wsUrl, {
-      headers: {
-        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-      }
-    });
-
-    openAiWs.on("open", () => {
-      console.log(`OpenAI transcription WebSocket connected for ${participantType}`);
-
-      const sessionConfig = {
-        type: "session.update",
-        session: {
-          type: "realtime",
-          model: "gpt-realtime",
-          output_modalities: ["text"],
-          audio: {
-            input: {
-              format: { 
-                type: "audio/pcmu" 
-              },
-              turn_detection: { 
-                type: "server_vad",
-                //eagerness: "medium", // Determine how likely the model is to detect the end of speech
-                threshold: 0.5, // VAD sensitivity
-                prefix_padding_ms: 300, // Add silence before speech detection
-                silence_duration_ms: 500, // Add a wait time before detecting end of speech
-              },
-              transcription: {
-                model: "gpt-4o-transcribe",
-                prompt: "Transcribe the following audio message. Ensure that you transcribe in the exact same language as spoken in the audio. Do not translate or interpret the content, just provide a verbatim transcription.",
-                language: "en"
-              },
-            },
-          },
-        }
-      };
-
-      openAiWs.send(JSON.stringify(sessionConfig));
-    });
-
-    openAiWs.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-
-        if (msg.type === "conversation.item.input_audio_transcription.completed") {
-          const transcript = msg.transcript;
-          
-          if (!transcript || !transcript.trim()) return;
-
-          // Determine message type based on participant
-          const messageType = participantType === 'caller' ? 'user' : 'humanAgent';
-          
-          console.log(`${participantType === 'caller' ? 'Caller' : 'Human Agent'} said: ${transcript}`);
-          
-          if (onTranscript) {
-            onTranscript(messageType, transcript);
-          }
-        }
-
-      } catch (e) {
-        console.error("Error processing OpenAI message:", e);
-      }
-    });
-
-    openAiWs.on("close", () => {
-      console.log(`OpenAI transcription WebSocket closed for ${participantType}`);
-    });
-    
-    openAiWs.on("error", (err) => {
-      console.error(`OpenAI WS error for ${participantType}:`, err);
-    });
-
-    return openAiWs;
   }
 
   /**
